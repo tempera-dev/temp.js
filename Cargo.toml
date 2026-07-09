@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/jadenfix/temp.js"
+repository = "https://github.com/tempera-dev/temp.js"
 rust-version = "1.96"
 
 [workspace.dependencies]
