@@ -876,6 +876,75 @@ export const agent = {
         assert!(error.contains("idempotency_required"), "{error}");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_meta_rejects_malformed_action_authority_before_serializing() {
+        let app = TempDir::new();
+        app.write(
+            "app/routes/api/missing-auth.ts",
+            r#"
+export const agent = {
+  actions: [{name: "hello.contact", inputSchema: {type: "object"}}],
+};
+"#,
+        );
+        let specifier = deno_core::ModuleSpecifier::from_file_path(
+            app.path().join("app/routes/api/missing-auth.ts"),
+        )
+        .unwrap()
+        .to_string();
+        let mut runtime = runtime_with_bootstrap();
+        let error = route_meta(&mut runtime, &specifier)
+            .await
+            .expect_err("omitted action authority should fail closed");
+        assert!(error.contains("requires auth"), "{error}");
+
+        for (name, auth, expected) in [
+            ("null", "null", "auth must be an object"),
+            (
+                "public-scopes",
+                r#"{type: "public", scopes: []}"#,
+                "public auth must contain only type",
+            ),
+            (
+                "duplicate-scopes",
+                r#"{type: "user", scopes: ["route:read", "route:read"]}"#,
+                "scopes must be unique",
+            ),
+            (
+                "sparse-scopes",
+                r#"{type: "admin", scopes: Array(1)}"#,
+                "RFC 6749 scope-token syntax",
+            ),
+        ] {
+            let app = TempDir::new();
+            app.write(
+                "app/routes/api/contact.ts",
+                &format!(
+                    r#"
+export const agent = {{
+  actions: [{{
+    name: "hello.contact",
+    inputSchema: {{type: "object"}},
+    auth: {auth},
+  }}],
+}};
+"#
+                ),
+            );
+            let specifier = deno_core::ModuleSpecifier::from_file_path(
+                app.path().join("app/routes/api/contact.ts"),
+            )
+            .unwrap()
+            .to_string();
+            let mut runtime = runtime_with_bootstrap();
+
+            let error = route_meta(&mut runtime, &specifier)
+                .await
+                .expect_err("malformed action authority should fail closed");
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
     #[test]
     fn stream_body_channel_is_bounded() {
         let (tx, _rx) = stream_body_channel();

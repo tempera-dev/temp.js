@@ -42,6 +42,16 @@ pub struct RouteActionTool {
     pub auth: Value,
 }
 
+impl RouteActionTool {
+    pub fn has_public_authority(&self) -> bool {
+        let Some(object) = self.auth.as_object() else {
+            return false;
+        };
+        object.len() == 1
+            && object.get("type").and_then(serde_json::Value::as_str) == Some("public")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteResource {
     pub pattern: String,
@@ -519,22 +529,27 @@ fn tools_json(registry: &ToolRegistry, route_actions: &[RouteActionTool]) -> Val
             })
         })
         .collect();
-    tools.extend(route_actions.iter().map(|action| {
-        json!({
-            "name": action.name,
-            "description": action.description,
-            "inputSchema": action.input_schema,
-            "x-beater-action": {
-                "method": action.method,
-                "path": action.path,
-                "sideEffect": action.side_effect,
-                "confirm": action.confirm,
-                "dryRun": action.dry_run,
-                "idempotencyRequired": action.idempotency_required,
-                "auth": action.auth,
-            }
-        })
-    }));
+    tools.extend(
+        route_actions
+            .iter()
+            .filter(|action| action.has_public_authority())
+            .map(|action| {
+                json!({
+                    "name": action.name,
+                    "description": action.description,
+                    "inputSchema": action.input_schema,
+                    "x-beater-action": {
+                        "method": action.method,
+                        "path": action.path,
+                        "sideEffect": action.side_effect,
+                        "confirm": action.confirm,
+                        "dryRun": action.dry_run,
+                        "idempotencyRequired": action.idempotency_required,
+                        "auth": action.auth,
+                    }
+                })
+            }),
+    );
     Value::Array(tools)
 }
 
@@ -684,7 +699,10 @@ fn resources_list(
         "description": "Markdown index of beater.js routes and route-bound actions.",
         "mimeType": "text/markdown",
     })];
-    if !route_actions.is_empty() {
+    if route_actions
+        .iter()
+        .any(RouteActionTool::has_public_authority)
+    {
         resources.push(json!({
             "uri": "beater://actions",
             "name": "Route actions",
@@ -810,7 +828,11 @@ fn route_resource_markdown(
     route_resources: &[RouteResource],
     route_actions: &[RouteActionTool],
 ) -> ResourceMarkdown {
-    let mut out = ResourceMarkdownBuilder::new(route_resources.len() + route_actions.len());
+    let public_action_count = route_actions
+        .iter()
+        .filter(|action| action.has_public_authority())
+        .count();
+    let mut out = ResourceMarkdownBuilder::new(route_resources.len() + public_action_count);
     out.push_static("# beater.js route table\n\n");
     out.push_static("## Routes\n\n");
     if route_resources.is_empty() {
@@ -827,7 +849,7 @@ fn route_resource_markdown(
             ));
         }
     }
-    if route_actions.is_empty() {
+    if public_action_count == 0 {
         out.push_static("\n## Actions\n\nNo route-bound actions are registered.\n");
     } else {
         push_action_markdown(&mut out, route_actions);
@@ -836,20 +858,30 @@ fn route_resource_markdown(
 }
 
 fn action_resource_markdown(route_actions: &[RouteActionTool]) -> ResourceMarkdown {
-    let mut out = ResourceMarkdownBuilder::new(route_actions.len());
+    let public_action_count = route_actions
+        .iter()
+        .filter(|action| action.has_public_authority())
+        .count();
+    let mut out = ResourceMarkdownBuilder::new(public_action_count);
     push_action_markdown(&mut out, route_actions);
     out.finish()
 }
 
 fn push_action_markdown(out: &mut ResourceMarkdownBuilder, route_actions: &[RouteActionTool]) {
     out.push_static("\n## Actions\n\n");
-    if route_actions.is_empty() {
+    if !route_actions
+        .iter()
+        .any(RouteActionTool::has_public_authority)
+    {
         out.push_static("No route-bound actions are registered.\n");
         return;
     }
     out.push_static("| name | method | path | side effect | confirm | idempotency required |\n");
     out.push_static("|---|---|---|---|---|---|\n");
-    for action in route_actions {
+    for action in route_actions
+        .iter()
+        .filter(|action| action.has_public_authority())
+    {
         out.push_row(format!(
             "| {} | {} | {} | {} | {} | {} |\n",
             markdown_table_cell(&action.name),
@@ -887,7 +919,7 @@ async fn tools_call(
     let route_action = if registry.get(name).is_none() {
         route_actions
             .iter()
-            .find(|action| action.name == name)
+            .find(|action| action.name == name && action.has_public_authority())
             .cloned()
     } else {
         None
@@ -1427,7 +1459,7 @@ mod tests {
             "required": ["email", "confirm"],
             "additionalProperties": false
         });
-        let route_actions = vec![RouteActionTool {
+        let public = RouteActionTool {
             name: "hello.contact".to_string(),
             description: "Send a contact request.".to_string(),
             input_schema: schema.clone(),
@@ -1438,13 +1470,79 @@ mod tests {
             dry_run: false,
             idempotency_required: true,
             auth: json!({"type": "public"}),
-        }];
+        };
+        let mut protected = public.clone();
+        protected.name = "hello.protected".to_string();
+        protected.auth = json!({"type": "user", "scopes": ["contact:read"]});
+        let route_actions = vec![public, protected];
 
         let tools = tools_json(&ToolRegistry::empty(), &route_actions);
 
+        assert_eq!(tools.as_array().unwrap().len(), 1);
         assert_eq!(tools[0]["name"], "hello.contact");
         assert_eq!(tools[0]["inputSchema"], schema);
         assert_eq!(tools[0]["x-beater-action"]["path"], "/api/actions/contact");
+        let action_index = super::action_resource_markdown(&route_actions);
+        assert!(action_index.text.contains("hello.contact"));
+        assert!(!action_index.text.contains("hello.protected"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_rejects_non_public_route_action_before_execution() {
+        let app = TempApp::new("route-action-auth-denied");
+        let registry = ToolRegistry::empty();
+        let route_actions = vec![RouteActionTool {
+            name: "contacts.export".to_string(),
+            description: "Export contacts".to_string(),
+            input_schema: json!({"type": "object"}),
+            method: "POST".to_string(),
+            path: "/api/contacts/export".to_string(),
+            side_effect: "write".to_string(),
+            confirm: false,
+            dry_run: false,
+            idempotency_required: false,
+            auth: json!({"type": "admin", "scopes": ["contacts:export"]}),
+        }];
+        let executed = Arc::new(Mutex::new(false));
+        let executed_for_call = Arc::clone(&executed);
+        let resources = super::resources_list(&[], &route_actions).unwrap();
+        assert_eq!(resources["resources"].as_array().unwrap().len(), 1);
+        assert_eq!(resources["resources"][0]["uri"], "beater://routes");
+        let action_index = super::action_resource_markdown(&route_actions);
+        assert!(
+            action_index
+                .text
+                .contains("No route-bound actions are registered.")
+        );
+
+        let response = handle_post(
+            &registry,
+            RouteCatalog {
+                actions: &route_actions,
+                resources: &[],
+            },
+            &AccessConfig::default(),
+            app.path(),
+            &HeaderMap::new(),
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"contacts.export","arguments":{}}}"#,
+            move |_action, _arguments, _context, _payment_headers| {
+                let executed = Arc::clone(&executed_for_call);
+                Pin::from(Box::new(async move {
+                    *executed.lock().unwrap() = true;
+                    Ok("{}".to_string())
+                }) as Box<dyn Future<Output = anyhow::Result<String>> + Send>)
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(
+            response["error"]["message"],
+            "unknown tool: contacts.export"
+        );
+        assert!(!*executed.lock().unwrap());
     }
 
     #[tokio::test]
@@ -1466,7 +1564,7 @@ mod tests {
             confirm: true,
             dry_run: false,
             idempotency_required: true,
-            auth: Value::Null,
+            auth: json!({"type": "public"}),
         }];
         let route_resources = vec![
             RouteResource {
@@ -1814,7 +1912,7 @@ mod tests {
             confirm: false,
             dry_run: false,
             idempotency_required: false,
-            auth: Value::Null,
+            auth: json!({"type": "public"}),
         }];
         let seen = Arc::new(Mutex::new(PaymentHeaders::default()));
         let seen_for_executor = Arc::clone(&seen);

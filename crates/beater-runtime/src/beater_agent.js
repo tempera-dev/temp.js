@@ -60,6 +60,43 @@ function validateActionInputSchema(schema, actionName) {
   return schema;
 }
 
+function validateActionAuth(auth, actionName) {
+  if (!auth || typeof auth !== "object" || Array.isArray(auth)) {
+    throw new Error(`defineAction(${actionName}) auth must be an object`);
+  }
+  const keys = Object.keys(auth);
+  if (auth.type === "public") {
+    if (keys.length !== 1 || keys[0] !== "type") {
+      throw new Error(`defineAction(${actionName}) public auth must contain only type`);
+    }
+    return {type: "public"};
+  }
+  if (auth.type !== "user" && auth.type !== "admin") {
+    throw new Error(`defineAction(${actionName}) auth.type must be public, user, or admin`);
+  }
+  if (keys.length !== 2 || !hasOwn(auth, "type") || !hasOwn(auth, "scopes")) {
+    throw new Error(`defineAction(${actionName}) ${auth.type} auth must contain exactly type and scopes`);
+  }
+  if (!Array.isArray(auth.scopes) || auth.scopes.length === 0 || auth.scopes.length > 64) {
+    throw new Error(`defineAction(${actionName}) ${auth.type} auth scopes must contain 1 to 64 entries`);
+  }
+  const scopes = Array.from(auth.scopes, (scope) => {
+    if (
+      typeof scope !== "string" ||
+      scope.length === 0 ||
+      scope.length > 256 ||
+      !/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)
+    ) {
+      throw new Error(`defineAction(${actionName}) auth scopes must use RFC 6749 scope-token syntax`);
+    }
+    return scope;
+  });
+  if (new Set(scopes).size !== scopes.length) {
+    throw new Error(`defineAction(${actionName}) auth scopes must be unique`);
+  }
+  return {type: auth.type, scopes};
+}
+
 export function defineAction(cfg) {
   if (!cfg || typeof cfg !== "object") {
     throw new Error("defineAction(config) requires a config object");
@@ -71,6 +108,10 @@ export function defineAction(cfg) {
   if (!hasOwn(cfg, "inputSchema")) {
     throw new Error(`defineAction(${cfg.name}) requires config.inputSchema`);
   }
+  if (!hasOwn(cfg, "auth")) {
+    throw new Error(`defineAction(${cfg.name}) requires config.auth`);
+  }
+  const auth = validateActionAuth(cfg.auth, cfg.name);
   return {
     name: cfg.name,
     description: cfg.description ?? `Call ${cfg.name}.`,
@@ -80,7 +121,7 @@ export function defineAction(cfg) {
     confirm: cfg.confirm === true,
     dryRun: cfg.dryRun === true,
     idempotencyRequired: cfg.idempotencyRequired === true,
-    auth: cfg.auth ?? { type: "public" },
+    auth,
   };
 }
 
