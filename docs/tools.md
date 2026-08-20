@@ -77,6 +77,8 @@ The route remains a normal HTML form target. The dev server also imports `agent.
 
 Route actions use canonical camelCase metadata. Legacy snake_case aliases such as `input_schema`, `side_effect`, `dry_run`, and `idempotency_required` are rejected for route actions. `inputSchema` is required, and it must be a self-contained object JSON Schema with `type: "object"` and no `$ref` anywhere in the schema, so MCP and OpenAPI callers see one authoritative argument shape.
 
+Route-action authority is explicit and fail closed: every action must own an `auth` field, and omission is rejected rather than defaulted to public. Today only exact `auth: {type: "public"}` actions are published to or executable through MCP and the generated OpenAPI contract. `user` and `admin` declarations require a non-empty, unique RFC 6749 scope-token list, but remain withheld until the runtime has a verified principal, role, and scope authority. `BEATER_MCP_TOKEN` authenticates the management endpoint; it is not a user/admin scope grant. The `auth` declaration does not secure the ordinary HTTP route, so its handler must enforce any direct-request authorization independently.
+
 ## Python tools
 
 Python tools are `.py` files loaded into embedded CPython. Each file must define:

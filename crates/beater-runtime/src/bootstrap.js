@@ -527,6 +527,47 @@
     return schema;
   }
 
+  function beaterActionAuth(action) {
+    if (!beaterHasOwn(action, "auth")) {
+      throw new Error(`route action ${action.name} requires auth`);
+    }
+    const auth = action.auth;
+    if (!auth || typeof auth !== "object" || Array.isArray(auth)) {
+      throw new Error(`route action ${action.name} auth must be an object`);
+    }
+    const keys = Object.keys(auth);
+    if (auth.type === "public") {
+      if (keys.length !== 1 || keys[0] !== "type") {
+        throw new Error(`route action ${action.name} public auth must contain only type`);
+      }
+      return {type: "public"};
+    }
+    if (auth.type !== "user" && auth.type !== "admin") {
+      throw new Error(`route action ${action.name} auth.type must be public, user, or admin`);
+    }
+    if (keys.length !== 2 || !beaterHasOwn(auth, "type") || !beaterHasOwn(auth, "scopes")) {
+      throw new Error(`route action ${action.name} ${auth.type} auth must contain exactly type and scopes`);
+    }
+    if (!Array.isArray(auth.scopes) || auth.scopes.length === 0 || auth.scopes.length > 64) {
+      throw new Error(`route action ${action.name} ${auth.type} auth scopes must contain 1 to 64 entries`);
+    }
+    const scopes = Array.from(auth.scopes, (scope) => {
+      if (
+        typeof scope !== "string" ||
+        scope.length === 0 ||
+        scope.length > 256 ||
+        !/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)
+      ) {
+        throw new Error(`route action ${action.name} auth scopes must use RFC 6749 scope-token syntax`);
+      }
+      return scope;
+    });
+    if (new Set(scopes).size !== scopes.length) {
+      throw new Error(`route action ${action.name} auth scopes must be unique`);
+    }
+    return {type: auth.type, scopes};
+  }
+
   globalThis.__beaterRouteMeta = async (specifier) => {
     const mod = await import(specifier);
     const meta = mod.agent;
@@ -543,7 +584,7 @@
             confirm: action.confirm === true,
             dryRun: action.dryRun === true,
             idempotencyRequired: action.idempotencyRequired === true,
-            auth: action.auth && typeof action.auth === "object" ? action.auth : { type: "public" },
+            auth: beaterActionAuth(action),
           }))
       : [];
     return {

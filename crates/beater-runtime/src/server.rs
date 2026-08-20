@@ -510,7 +510,7 @@ fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteAc
             return None;
         }
     };
-    Some(mcp::RouteActionTool {
+    let tool = mcp::RouteActionTool {
         name: name.to_string(),
         description,
         input_schema,
@@ -520,12 +520,15 @@ fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteAc
         confirm: action.confirm,
         dry_run: action.dry_run,
         idempotency_required: action.idempotency_required,
-        auth: if action.auth.is_object() {
-            action.auth
-        } else {
-            json!({"type": "public"})
-        },
-    })
+        auth: action.auth,
+    };
+    if !tool.has_public_authority() {
+        tracing::warn!(
+            "route action {name} withheld: only exact public auth is executable until verified user/admin authority is implemented"
+        );
+        return None;
+    }
+    Some(tool)
 }
 
 fn route_action_input_schema(schema: &serde_json::Value) -> Result<&serde_json::Value> {
@@ -2059,6 +2062,33 @@ mod tests {
             assert!(
                 route_action_tool("/api/actions/contact", test_route_action(schema)).is_none(),
                 "schema should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn route_action_tool_only_admits_exact_public_authority() {
+        let public = route_action_tool(
+            "/api/actions/contact",
+            test_route_action(json!({"type": "object"})),
+        )
+        .expect("exact public action should publish");
+        assert_eq!(public.auth, json!({"type": "public"}));
+
+        for auth in [
+            json!(null),
+            json!({}),
+            json!([]),
+            json!({"type": "public", "scopes": []}),
+            json!({"type": "user", "scopes": ["contact:read"]}),
+            json!({"type": "admin", "scopes": ["contact:write"]}),
+            json!({"type": "unknown"}),
+        ] {
+            let mut action = test_route_action(json!({"type": "object"}));
+            action.auth = auth;
+            assert!(
+                route_action_tool("/api/actions/contact", action).is_none(),
+                "non-public authority must not become an executable route tool"
             );
         }
     }

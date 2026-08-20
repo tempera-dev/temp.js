@@ -120,6 +120,7 @@ export default defineAgent({
         properties: {email: {type: "string"}},
         required: ["email"],
       },
+      auth: {type: "public"},
     }),
   ],
 });
@@ -130,6 +131,7 @@ export default defineAgent({
         let config = load_agent_config(app.path(), "operator").unwrap();
 
         assert_eq!(config["tools"][0]["name"], "hello.contact");
+        assert_eq!(config["tools"][0]["auth"], json!({"type": "public"}));
         assert_eq!(
             config["tools"][0]["inputSchema"],
             json!({
@@ -175,6 +177,7 @@ export default defineAgent({
                     type: "object",
                     properties: {email: {$ref: "#/$defs/Email"}},
                   },
+                  auth: {type: "public"},
                 }"##,
                 "must not use $ref",
             ),
@@ -199,6 +202,109 @@ export default defineAgent({{
 
             let error = load_agent_config(app.path(), "operator")
                 .expect_err("invalid defineAction schema should fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn define_action_validates_exact_authority_contracts() {
+        let app = TempApp::new("define-action-auth");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAction, defineAgent } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    defineAction({
+      name: "hello.contact",
+      inputSchema: {type: "object"},
+      auth: {type: "user", scopes: ["contact:read", "contact:write"]},
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+        assert_eq!(
+            config["tools"][0]["auth"],
+            json!({"type": "user", "scopes": ["contact:read", "contact:write"]})
+        );
+
+        let missing = TempApp::new("missing-auth");
+        fs::write(
+            missing.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAction, defineAgent } from "beater:agent";
+export default defineAgent({
+  name: "operator",
+  tools: [defineAction({name: "hello.contact", inputSchema: {type: "object"}})],
+});
+"#,
+        )
+        .unwrap();
+        let error = load_agent_config(missing.path(), "operator")
+            .expect_err("omitted action authority should fail closed");
+        assert!(format!("{error:#}").contains("requires config.auth"));
+
+        for (name, auth, expected) in [
+            ("null-auth", "null", "auth must be an object"),
+            (
+                "public-scopes",
+                r#"{type: "public", scopes: []}"#,
+                "public auth must contain only type",
+            ),
+            (
+                "empty-user",
+                r#"{type: "user", scopes: []}"#,
+                "scopes must contain 1 to 64 entries",
+            ),
+            (
+                "duplicate-scopes",
+                r#"{type: "admin", scopes: ["admin:write", "admin:write"]}"#,
+                "scopes must be unique",
+            ),
+            (
+                "invalid-scope",
+                r#"{type: "user", scopes: ["contact read"]}"#,
+                "RFC 6749 scope-token syntax",
+            ),
+            (
+                "sparse-scopes",
+                r#"{type: "user", scopes: Array(1)}"#,
+                "RFC 6749 scope-token syntax",
+            ),
+            (
+                "unknown-auth-key",
+                r#"{type: "user", scopes: ["contact:read"], audience: "contact"}"#,
+                "must contain exactly type and scopes",
+            ),
+        ] {
+            let app = TempApp::new(name);
+            fs::write(
+                app.path().join("agents/operator/agent.ts"),
+                format!(
+                    r#"
+import {{ defineAction, defineAgent }} from "beater:agent";
+
+export default defineAgent({{
+  name: "operator",
+  tools: [defineAction({{
+    name: "hello.contact",
+    inputSchema: {{type: "object"}},
+    auth: {auth},
+  }})],
+}});
+"#
+                ),
+            )
+            .unwrap();
+
+            let error = load_agent_config(app.path(), "operator")
+                .expect_err("invalid action authority should fail closed");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
     }

@@ -48,6 +48,8 @@ Runtime route actions use `defineAction` in an API route's `agent.actions` metad
 
 Runtime route actions must declare canonical camelCase metadata, including `inputSchema`, `sideEffect`, `dryRun`, and `idempotencyRequired`. Legacy snake_case aliases are rejected. The schema is published unchanged to MCP and OpenAPI only when it is a self-contained object JSON Schema with `type: "object"` and no `$ref`; ambiguous aliases and opaque schemas are rejected before they become agent-visible contracts.
 
+Runtime route-action authority is explicit and fail closed. Every action must own an `auth` field; omission is rejected rather than defaulted to public. Exact public declarations are the only actions currently admitted to MCP and runtime OpenAPI. Canonical user/admin declarations retain ordered unique RFC 6749 scope tokens but are withheld until the runtime can verify a caller principal, role, and scopes; the opaque MCP management token is not treated as that authority. Direct HTTP requests still reach the route normally and must be authorized by the route handler itself.
+
 ### First-Party Python
 
 Use `pyTool` for app-owned Python code:
