@@ -14,7 +14,7 @@ use crate::registry::{
 };
 use crate::resume_contract::ToolResumeContract;
 use crate::trace_export;
-use beater_journal::Journal;
+use beater_journal::{GoalRunGate, GoalRunNeedsReview, GoalScope, Journal};
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
@@ -31,6 +31,17 @@ struct Ctx {
 pub struct JournaledToolCall {
     pub seq: i64,
     pub context: ToolCallContext,
+}
+
+/// Trusted-local linkage, not authenticated scope or effect authority. Keep the
+/// caller-chosen run ID to resume the same durable work after a setup failure.
+pub struct GoalRunRequest {
+    pub run_id: String,
+    pub scope: GoalScope,
+    pub goal_id: String,
+    pub expected_revision: i64,
+    pub agent_name: String,
+    pub prompt: String,
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -95,9 +106,42 @@ pub fn run(
         run_id,
     };
     let messages = vec![json!({"role": "user", "content": prompt})];
-    let result = runtime()?.block_on(agent_loop(&ctx, messages, 1));
+    let result = runtime()?.block_on(async {
+        let result = agent_loop(&ctx, messages, 1).await;
+        finish_goal_review(&ctx, result).await
+    });
     export_run_trace_best_effort(app_dir, &ctx.run_id);
     result
+}
+
+/// Atomically persist a goal-bound run, then use the existing worker under the
+/// same ownership lock. A duplicate run ID is an error; use `resume` thereafter.
+pub fn run_for_goal(
+    app_dir: &Path,
+    request: &GoalRunRequest,
+    venv: Option<PathBuf>,
+    beatbox: BeatboxConfig,
+    load_config: impl Fn(&str) -> Result<Value>,
+) -> Result<()> {
+    let _ownership = RunOwnership::acquire(app_dir, &request.run_id)?;
+    let journal = Journal::open(app_dir)?;
+    journal.create_goal_bound_run(
+        &request.scope,
+        &request.goal_id,
+        request.expected_revision,
+        &request.run_id,
+        &request.agent_name,
+        &request.prompt,
+    )?;
+    println!("run {}", request.run_id);
+    resume_owned(
+        app_dir,
+        &request.run_id,
+        journal,
+        venv,
+        beatbox,
+        load_config,
+    )
 }
 
 pub fn resume(
@@ -109,7 +153,22 @@ pub fn resume(
 ) -> Result<()> {
     let _ownership = RunOwnership::acquire(app_dir, run_id)?;
     let journal = Journal::open(app_dir)?;
+    resume_owned(app_dir, run_id, journal, venv, beatbox, load_config)
+}
+
+fn resume_owned(
+    app_dir: &Path,
+    run_id: &str,
+    journal: Journal,
+    venv: Option<PathBuf>,
+    beatbox: BeatboxConfig,
+    load_config: impl Fn(&str) -> Result<Value>,
+) -> Result<()> {
     let run = journal.run(run_id)?;
+    if matches!(journal.gate_goal_run(run_id)?, GoalRunGate::NeedsReview) {
+        println!("run {run_id} needs review: its goal binding is no longer current");
+        return Ok(());
+    }
     if run.status == "completed" {
         println!("run {run_id} already completed");
         return Ok(());
@@ -117,6 +176,10 @@ pub fn resume(
     cleanup_stale_browser_sessions(app_dir, run_id)
         .with_context(|| format!("cleaning stale browser sessions for run {run_id}"))?;
     let config_value = load_config(&run.agent)?;
+    anyhow::ensure!(
+        config_value["name"].as_str() == Some(run.agent.as_str()),
+        "resumed agent configuration does not match the saved agent"
+    );
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
     let llm = LlmSelection::from_config(&config)?;
@@ -129,9 +192,31 @@ pub fn resume(
         model: llm.model,
         run_id: run_id.to_string(),
     };
-    let result = runtime()?.block_on(resume_async(&ctx, run, steps));
+    let result = runtime()?.block_on(async {
+        let result = resume_async(&ctx, run, steps).await;
+        finish_goal_review(&ctx, result).await
+    });
     export_run_trace_best_effort(app_dir, &ctx.run_id);
     result
+}
+
+async fn finish_goal_review(ctx: &Ctx, result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.downcast_ref::<GoalRunNeedsReview>().is_some() => {
+            println!(
+                "run {} needs review: its goal binding is no longer current",
+                ctx.run_id
+            );
+            close_browser_sessions_best_effort(ctx).await;
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn is_review_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ToolNeedsReview>().is_some()
+        || error.downcast_ref::<GoalRunNeedsReview>().is_some()
 }
 
 fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
@@ -274,7 +359,7 @@ async fn resume_async(
                                 Ok(content) => {
                                     json!({"type": "tool_result", "tool_use_id": id, "content": content})
                                 }
-                                Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
+                                Err(e) if is_review_error(&e) => {
                                     println!("← needs review: {e:#}");
                                     ctx.journal.set_run_status(run_id, "needs_review")?;
                                     close_browser_sessions_best_effort(ctx).await;
@@ -388,7 +473,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                                 "type": "tool_result", "tool_use_id": id, "content": content,
                             }));
                         }
-                        Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
+                        Err(e) if is_review_error(&e) => {
                             println!("← needs review: {e:#}");
                             ctx.journal.set_run_status(&ctx.run_id, "needs_review")?;
                             close_browser_sessions_best_effort(ctx).await;
@@ -788,6 +873,13 @@ def run(input):
 
     impl MockAnthropic {
         fn new(responses: Vec<Value>) -> Self {
+            Self::before_response(responses, || {})
+        }
+
+        fn before_response(
+            responses: Vec<Value>,
+            mut before_response: impl FnMut() + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -801,6 +893,7 @@ def run(input):
                     let (mut stream, _) = listener.accept().unwrap();
                     let body = read_http_body(&mut stream);
                     server_requests.lock().unwrap().push(body);
+                    before_response();
                     let reply = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
                         response
@@ -1308,6 +1401,221 @@ def run(input):
             "created_at": "2026-07-02T00:00:00Z",
             "updated_at": "2026-07-02T00:00:00Z",
         })
+    }
+
+    #[test]
+    fn goal_run_stale_creation_never_loads_configuration() {
+        let app = TempApp::new("goal-stale-create");
+        let journal = Journal::open(app.path()).unwrap();
+        let mut request = create_goal_request(&journal);
+        request.expected_revision = 2;
+        assert!(
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                panic!("stale goal must be rejected before configuration")
+            })
+            .is_err()
+        );
+        assert!(journal.run(&request.run_id).is_err());
+        assert!(journal.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_run_stale_resume_parks_before_configuration() {
+        let app = TempApp::new("goal-stale-resume");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                1,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        journal
+            .start_step(
+                &request.run_id,
+                "llm_call",
+                &json!({"messages": []}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        revise_test_goal(&journal, &request.scope);
+        resume(
+            app.path(),
+            &request.run_id,
+            None,
+            BeatboxConfig::default(),
+            |_| panic!("stale goal must be parked before configuration"),
+        )
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn goal_run_current_uses_existing_worker_and_completes() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("goal-current-run");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "local test response"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+        super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(server.join().len(), 1);
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "completed");
+        assert!(
+            matches!(journal.gate_goal_run(&request.run_id).unwrap(), beater_journal::GoalRunGate::Current(binding) if binding.goal_revision == 1 && binding.scope == request.scope)
+        );
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 1);
+        revise_test_goal(&journal, &request.scope);
+        resume(
+            app.path(),
+            &request.run_id,
+            None,
+            BeatboxConfig::default(),
+            |_| panic!("historically completed work must be checked against the corrected goal"),
+        )
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        let steps = journal.steps(&request.run_id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].status, "completed",
+            "retain historical response evidence"
+        );
+    }
+
+    #[test]
+    fn goal_run_changed_during_setup_never_starts_model_step() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("goal-setup-change");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+        super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            revise_test_goal(&journal, &request.scope);
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert!(journal.steps(&request.run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_run_changed_during_model_call_cannot_dispatch_tool_or_mark_complete() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for response in [
+            json!({"content": [{"type": "text", "text": "old goal answer"}], "stop_reason": "end_turn"}),
+            json!({"content": [{"type": "tool_use", "id": "toolu_1", "name": "echo", "input": {"value": "old"}}], "stop_reason": "tool_use"}),
+        ] {
+            let app = TempApp::new("goal-inflight-change");
+            let journal = Journal::open(app.path()).unwrap();
+            let request = create_goal_request(&journal);
+            let app_path = app.path().to_path_buf();
+            let scope = request.scope.clone();
+            let server = MockAnthropic::before_response(vec![response], move || {
+                revise_test_goal(&Journal::open(&app_path).unwrap(), &scope);
+            });
+            let _env = EnvGuard::set(&server.base_url);
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert_eq!(server.join().len(), 1);
+            assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+            let steps = journal.steps(&request.run_id).unwrap();
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].kind, "llm_call");
+            assert_eq!(steps[0].status, "completed");
+            assert!(
+                steps[0].result.is_some(),
+                "retain the actual old response without claiming current completion"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_run_rejects_different_agent_before_registry_setup() {
+        let app = TempApp::new("goal-config-name");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let error =
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(json!({"name": "other", "tools": [{"kind": "python", "path": "missing.py"}]}))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("saved agent"));
+        assert!(journal.steps(&request.run_id).unwrap().is_empty());
+    }
+
+    fn create_goal_request(journal: &Journal) -> super::GoalRunRequest {
+        use beater_journal::{Goal, GoalMutation, GoalScope, PlaybookIdentity};
+        let scope = GoalScope {
+            organization: "org".into(),
+            project: "project".into(),
+            environment: "test".into(),
+            site: "site".into(),
+        };
+        journal
+            .create_goal(
+                &GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "create".into(),
+                    operation: "create".into(),
+                },
+                Goal {
+                    id: "goal".into(),
+                    scope: scope.clone(),
+                    revision: 1,
+                    objective: "Prepare a current proposal".into(),
+                    playbook: PlaybookIdentity {
+                        id: "generic-preparation".into(),
+                        digest: "a".repeat(64),
+                    },
+                    parameters: Default::default(),
+                },
+            )
+            .unwrap();
+        super::GoalRunRequest {
+            run_id: "goal-run".into(),
+            scope,
+            goal_id: "goal".into(),
+            expected_revision: 1,
+            agent_name: "support".into(),
+            prompt: "Prepare current goal".into(),
+        }
+    }
+
+    fn revise_test_goal(journal: &Journal, scope: &beater_journal::GoalScope) {
+        use beater_journal::{GoalMutation, GoalPatch};
+        journal
+            .revise_goal(
+                &GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "correct".into(),
+                    operation: "correct".into(),
+                },
+                scope,
+                "goal",
+                1,
+                GoalPatch {
+                    objective: Some("Prepare a revised proposal".into()),
+                    playbook: None,
+                    parameters: None,
+                },
+            )
+            .unwrap();
     }
 
     #[test]

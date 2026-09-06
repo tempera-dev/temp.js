@@ -20,6 +20,37 @@ pub struct Journal {
     conn: Connection,
 }
 
+/// Versioned, immutable local binding between one run and one exact goal revision.
+/// This is storage linkage only; it is not admission, execution authority, or proof.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRunBinding {
+    pub version: u8,
+    pub run_id: String,
+    pub scope: GoalScope,
+    pub goal_id: String,
+    pub goal_revision: i64,
+}
+
+/// The caller must stop work when a non-null binding cannot be proven current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalRunGate {
+    Unbound,
+    Current(GoalRunBinding),
+    NeedsReview,
+}
+
+#[derive(Debug)]
+pub struct GoalRunNeedsReview;
+
+impl std::fmt::Display for GoalRunNeedsReview {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("goal-bound run needs review")
+    }
+}
+
+impl std::error::Error for GoalRunNeedsReview {}
+
 #[derive(Debug)]
 pub struct RunRow {
     pub id: String,
@@ -58,6 +89,7 @@ pub struct StepPartialRow {
 /// The four coordinates are storage isolation keys.  They deliberately make no
 /// claim that the caller has been admitted or authenticated by a native service.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoalScope {
     pub organization: String,
     pub project: String,
@@ -151,6 +183,7 @@ const MAX_PARAMETER_NODES: usize = 1_024;
 const MAX_MILESTONES: usize = 128;
 const MAX_EVIDENCE: usize = 32;
 const MAX_REVISION: i64 = 1_000_000_000;
+const GOAL_RUN_BINDING_VERSION: u8 = 1;
 
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
@@ -361,6 +394,34 @@ fn validate_history_window(window: HistoryWindow) -> Result<()> {
     Ok(())
 }
 
+fn validate_goal_run_binding(binding: &GoalRunBinding) -> Result<()> {
+    ensure!(
+        binding.version == GOAL_RUN_BINDING_VERSION,
+        "invalid goal run binding version"
+    );
+    ensure!(valid_identifier(&binding.run_id), "invalid goal run id");
+    validate_scope(&binding.scope)?;
+    ensure!(
+        valid_identifier(&binding.goal_id),
+        "invalid goal run target"
+    );
+    ensure!(
+        (1..=MAX_REVISION).contains(&binding.goal_revision),
+        "invalid goal run revision"
+    );
+    Ok(())
+}
+
+fn validate_new_run(run_id: &str, agent: &str, input: &str) -> Result<()> {
+    ensure!(valid_identifier(run_id), "invalid run id");
+    ensure!(valid_identifier(agent), "invalid run agent");
+    ensure!(
+        !input.is_empty() && input.len() <= MAX_TEXT,
+        "invalid run input"
+    );
+    Ok(())
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -383,7 +444,8 @@ impl Journal {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs(
                id TEXT PRIMARY KEY, agent TEXT NOT NULL, status TEXT NOT NULL,
-               input TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+               input TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+               goal_binding TEXT);
              CREATE TABLE IF NOT EXISTS steps(
                run_id TEXT NOT NULL, seq INTEGER NOT NULL,
                kind TEXT NOT NULL, status TEXT NOT NULL,
@@ -401,6 +463,20 @@ impl Journal {
                PRIMARY KEY(run_id, seq, ordinal),
                FOREIGN KEY(run_id, seq) REFERENCES steps(run_id, seq));",
         )?;
+        {
+            let tx = conn.unchecked_transaction()?;
+            let has_goal_binding: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('runs') WHERE name = 'goal_binding' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if has_goal_binding.is_none() {
+                tx.execute_batch("ALTER TABLE runs ADD COLUMN goal_binding TEXT")?;
+            }
+            tx.commit()?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS goals(
                 organization TEXT NOT NULL, project TEXT NOT NULL, environment TEXT NOT NULL, site TEXT NOT NULL,
@@ -437,18 +513,169 @@ impl Journal {
 
     pub fn create_run(&self, id: &str, agent: &str, input: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO runs(id, agent, status, input, created_at, updated_at)
-             VALUES(?1, ?2, 'running', ?3, ?4, ?4)",
+            "INSERT INTO runs(id, agent, status, input, created_at, updated_at, goal_binding)
+             VALUES(?1, ?2, 'running', ?3, ?4, ?4, NULL)",
             params![id, agent, input, now()],
         )?;
         Ok(())
     }
 
+    /// Creates a run and its immutable goal-revision binding in one SQLite transaction.
+    pub fn create_goal_bound_run(
+        &self,
+        scope: &GoalScope,
+        goal_id: &str,
+        expected_revision: i64,
+        run_id: &str,
+        agent: &str,
+        input: &str,
+    ) -> Result<GoalRunBinding> {
+        validate_scope(scope)?;
+        ensure!(valid_identifier(goal_id), "invalid goal run target");
+        ensure!(
+            (1..=MAX_REVISION).contains(&expected_revision),
+            "invalid expected goal revision"
+        );
+        validate_new_run(run_id, agent, input)?;
+        let binding = GoalRunBinding {
+            version: GOAL_RUN_BINDING_VERSION,
+            run_id: run_id.into(),
+            scope: scope.clone(),
+            goal_id: goal_id.into(),
+            goal_revision: expected_revision,
+        };
+        let binding_json = serde_json::to_string(&binding)?;
+        let tx = self.conn.unchecked_transaction()?;
+        ensure!(
+            Self::goal_run_binding_is_current(&tx, &binding)?,
+            "goal revision conflict or corrupt goal"
+        );
+        tx.execute(
+            "INSERT INTO runs(id, agent, status, input, created_at, updated_at, goal_binding)
+             VALUES(?1, ?2, 'running', ?3, ?4, ?4, ?5)",
+            params![run_id, agent, input, now(), binding_json],
+        )?;
+        tx.commit()?;
+        Ok(binding)
+    }
+
+    /// Reads a nullable local binding and fails closed for any non-null value that
+    /// no longer names the exact current scoped goal revision.
+    pub fn gate_goal_run(&self, run_id: &str) -> Result<GoalRunGate> {
+        let tx = self.conn.unchecked_transaction()?;
+        let gate = Self::gate_goal_run_in_tx(&tx, run_id)?;
+        tx.commit()?;
+        Ok(gate)
+    }
+
+    fn mark_goal_run_needs_review(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<()> {
+        tx.execute(
+            "UPDATE runs SET status='needs_review', updated_at=?2 WHERE id=?1",
+            params![run_id, now()],
+        )?;
+        Ok(())
+    }
+
+    fn goal_run_binding_is_current(
+        tx: &rusqlite::Transaction<'_>,
+        binding: &GoalRunBinding,
+    ) -> Result<bool> {
+        if validate_goal_run_binding(binding).is_err() {
+            return Ok(false);
+        }
+        let row: Option<(String, String, Option<i64>, Option<String>)> = tx
+            .query_row(
+                "SELECT typeof(revision), typeof(body),
+                        CASE WHEN typeof(revision)='integer' THEN revision ELSE NULL END,
+                        CASE WHEN typeof(body)='text' AND length(CAST(body AS BLOB))<=65536 THEN body ELSE NULL END
+                 FROM goals WHERE organization=?1 AND project=?2 AND environment=?3 AND site=?4 AND id=?5",
+                params![
+                    binding.scope.organization,
+                    binding.scope.project,
+                    binding.scope.environment,
+                    binding.scope.site,
+                    binding.goal_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((revision_type, body_type, Some(stored_revision), Some(body))) = row else {
+            return Ok(false);
+        };
+        if revision_type != "integer" || body_type != "text" {
+            return Ok(false);
+        }
+        let Ok(goal) = serde_json::from_str::<Goal>(&body) else {
+            return Ok(false);
+        };
+        Ok(validate_goal(&goal).is_ok()
+            && goal.scope == binding.scope
+            && goal.id == binding.goal_id
+            && goal.revision == stored_revision
+            && stored_revision == binding.goal_revision)
+    }
+
+    fn gate_goal_run_in_tx(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<GoalRunGate> {
+        let (binding_type, raw): (String, Option<String>) = tx
+            .query_row(
+                "SELECT typeof(goal_binding),
+                        CASE WHEN typeof(goal_binding)='text' AND length(CAST(goal_binding AS BLOB))<=4096
+                             THEN goal_binding ELSE NULL END
+                 FROM runs WHERE id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("no run {run_id} in journal"))?;
+        if binding_type == "null" {
+            return Ok(GoalRunGate::Unbound);
+        }
+        let Some(raw) = raw else {
+            Self::mark_goal_run_needs_review(tx, run_id)?;
+            return Ok(GoalRunGate::NeedsReview);
+        };
+        let binding = match serde_json::from_str::<GoalRunBinding>(&raw) {
+            Ok(binding) if binding.run_id == run_id => binding,
+            _ => {
+                Self::mark_goal_run_needs_review(tx, run_id)?;
+                return Ok(GoalRunGate::NeedsReview);
+            }
+        };
+        if !Self::goal_run_binding_is_current(tx, &binding)? {
+            Self::mark_goal_run_needs_review(tx, run_id)?;
+            return Ok(GoalRunGate::NeedsReview);
+        }
+        Ok(GoalRunGate::Current(binding))
+    }
+
+    fn require_current_goal_run_in_tx(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<()> {
+        if matches!(
+            Self::gate_goal_run_in_tx(tx, run_id)?,
+            GoalRunGate::NeedsReview
+        ) {
+            return Err(GoalRunNeedsReview.into());
+        }
+        Ok(())
+    }
+
     pub fn set_run_status(&self, id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
+        if !matches!(status, "running" | "completed") {
+            self.conn.execute(
+                "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, status, now()],
+            )?;
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        if let Err(error) = Self::require_current_goal_run_in_tx(&tx, id) {
+            tx.commit()?;
+            return Err(error);
+        }
+        tx.execute(
             "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, status, now()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -507,6 +734,10 @@ impl Journal {
         attempt: i64,
     ) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
+        if let Err(error) = Self::require_current_goal_run_in_tx(&tx, run_id) {
+            tx.commit()?;
+            return Err(error);
+        }
         let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM steps WHERE run_id = ?1",
             params![run_id],
@@ -1947,6 +2178,401 @@ mod tests {
                 .milestones(&goal.scope, &goal.id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn goal_bound_run_is_atomic_and_reopens_with_current_gate() {
+        use super::{GoalRunGate, Journal};
+        let app = TempDir::new("goal-run-bound");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        let binding = journal
+            .create_goal_bound_run(
+                &goal.scope,
+                &goal.id,
+                goal.revision,
+                "run-bound",
+                "support",
+                "inspect goal",
+            )
+            .unwrap();
+        assert_eq!(binding.goal_revision, 1);
+        assert_eq!(
+            journal.gate_goal_run("run-bound").unwrap(),
+            GoalRunGate::Current(binding.clone())
+        );
+        journal
+            .start_step(
+                "run-bound",
+                "llm_call",
+                &json!({"messages": []}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        journal.set_run_status("run-bound", "completed").unwrap();
+        drop(journal);
+        let reopened = Journal::open(app.path()).unwrap();
+        assert_eq!(
+            reopened.gate_goal_run("run-bound").unwrap(),
+            GoalRunGate::Current(binding)
+        );
+        assert!(
+            reopened
+                .create_run("legacy", "support", "legacy run")
+                .is_ok()
+        );
+        assert_eq!(
+            reopened.gate_goal_run("legacy").unwrap(),
+            GoalRunGate::Unbound
+        );
+    }
+
+    #[test]
+    fn goal_bound_run_cas_wrong_scope_and_conflict_leave_no_run() {
+        let app = TempDir::new("goal-run-cas");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        let wrong_scope = super::GoalScope {
+            site: "other-site".into(),
+            ..goal.scope.clone()
+        };
+        for (scope, revision, run_id) in [
+            (&wrong_scope, goal.revision, "wrong-scope"),
+            (&goal.scope, goal.revision + 1, "wrong-revision"),
+        ] {
+            assert!(
+                journal
+                    .create_goal_bound_run(scope, &goal.id, revision, run_id, "support", "inspect")
+                    .is_err()
+            );
+            assert!(journal.run(run_id).is_err());
+        }
+        assert!(
+            journal
+                .create_goal_bound_run(
+                    &goal.scope,
+                    &goal.id,
+                    goal.revision,
+                    "bad input",
+                    "support",
+                    "inspect"
+                )
+                .is_err()
+        );
+        assert!(journal.run("bad input").is_err());
+    }
+
+    #[test]
+    fn bound_run_insert_failure_rolls_back_run_and_binding_together() {
+        let app = TempDir::new("goal-run-rollback");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        journal.conn.execute_batch("CREATE TRIGGER reject_bound_run BEFORE INSERT ON runs WHEN NEW.id='run-rollback' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        assert!(
+            journal
+                .create_goal_bound_run(
+                    &goal.scope,
+                    &goal.id,
+                    1,
+                    "run-rollback",
+                    "support",
+                    "inspect"
+                )
+                .is_err()
+        );
+        assert!(journal.run("run-rollback").is_err());
+        journal
+            .conn
+            .execute_batch("DROP TRIGGER reject_bound_run")
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_revision_and_binding_never_leave_a_current_old_binding() {
+        use std::sync::{Arc, Barrier};
+        let app = TempDir::new("goal-run-concurrent");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        let path = Arc::new(app.path().to_path_buf());
+        let scope = goal.scope.clone();
+        let id = goal.id.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let bind_path = path.clone();
+        let bind_scope = scope.clone();
+        let bind_id = id.clone();
+        let bind_barrier = barrier.clone();
+        let bind = std::thread::spawn(move || {
+            bind_barrier.wait();
+            Journal::open(&bind_path).unwrap().create_goal_bound_run(
+                &bind_scope,
+                &bind_id,
+                1,
+                "run-concurrent",
+                "support",
+                "inspect",
+            )
+        });
+        let revise_path = path.clone();
+        let revise_scope = scope.clone();
+        let revise_id = id.clone();
+        let revise = std::thread::spawn(move || {
+            barrier.wait();
+            Journal::open(&revise_path).unwrap().revise_goal(
+                &mutation("revise"),
+                &revise_scope,
+                &revise_id,
+                1,
+                super::GoalPatch {
+                    objective: Some("changed".into()),
+                    playbook: None,
+                    parameters: None,
+                },
+            )
+        });
+        let bound = bind.join().unwrap();
+        let revised = revise.join().unwrap();
+        let reopened = Journal::open(app.path()).unwrap();
+        match (bound, revised) {
+            (Ok(_), Ok(_)) => assert_eq!(
+                reopened.gate_goal_run("run-concurrent").unwrap(),
+                super::GoalRunGate::NeedsReview
+            ),
+            (Ok(binding), Err(_)) => assert_eq!(
+                reopened.gate_goal_run("run-concurrent").unwrap(),
+                super::GoalRunGate::Current(binding)
+            ),
+            (Err(_), Ok(_)) => assert!(reopened.run("run-concurrent").is_err()),
+            (Err(bind_error), Err(revise_error)) => {
+                panic!("concurrent bind and revision both failed: {bind_error:#}; {revise_error:#}")
+            }
+        }
+    }
+
+    #[test]
+    fn stale_or_malformed_goal_binding_persists_review_and_blocks_steps_completion() {
+        use super::{GoalRunGate, GoalRunNeedsReview};
+        let app = TempDir::new("goal-run-stale");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        journal
+            .create_goal_bound_run(&goal.scope, &goal.id, 1, "run-stale", "support", "inspect")
+            .unwrap();
+        journal
+            .revise_goal(
+                &mutation("revise"),
+                &goal.scope,
+                &goal.id,
+                1,
+                super::GoalPatch {
+                    objective: Some("changed".into()),
+                    playbook: None,
+                    parameters: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal.gate_goal_run("run-stale").unwrap(),
+            GoalRunGate::NeedsReview
+        );
+        let error = journal
+            .start_step("run-stale", "llm_call", &json!({}), None, None, 1)
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalRunNeedsReview>().is_some());
+        let error = journal
+            .set_run_status("run-stale", "completed")
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalRunNeedsReview>().is_some());
+        assert_eq!(journal.run("run-stale").unwrap().status, "needs_review");
+        assert!(journal.steps("run-stale").unwrap().is_empty());
+
+        journal
+            .create_run("run-malformed", "support", "inspect")
+            .unwrap();
+        journal
+            .conn
+            .execute(
+                "UPDATE runs SET goal_binding='{bad json' WHERE id='run-malformed'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            journal.gate_goal_run("run-malformed").unwrap(),
+            GoalRunGate::NeedsReview
+        );
+        assert_eq!(journal.run("run-malformed").unwrap().status, "needs_review");
+        journal
+            .create_run("run-unknown", "support", "inspect")
+            .unwrap();
+        journal.conn.execute(
+            "UPDATE runs SET goal_binding=?1 WHERE id='run-unknown'",
+            [r#"{"version":1,"run_id":"run-unknown","scope":{"organization":"org","project":"project","environment":"env","site":"site","extra":"forged"},"goal_id":"bounded-goal","goal_revision":1}"#],
+        ).unwrap();
+        assert_eq!(
+            journal.gate_goal_run("run-unknown").unwrap(),
+            GoalRunGate::NeedsReview
+        );
+    }
+
+    #[test]
+    fn sql_type_or_size_corruption_persists_review_without_loading_or_stepping() {
+        use super::{GoalRunGate, GoalRunNeedsReview};
+        for (label, corrupt_goal) in [
+            ("wrong-revision-type", "UPDATE goals SET revision='wrong'"),
+            ("blob-body", "UPDATE goals SET body=X'00'"),
+            ("corrupt-body", "UPDATE goals SET body='{}'"),
+            ("missing-goal", "DELETE FROM goals"),
+        ] {
+            let app = TempDir::new(label);
+            let journal = Journal::open(app.path()).unwrap();
+            let goal = journal
+                .create_goal(&mutation("create"), sample_goal())
+                .unwrap();
+            journal
+                .create_goal_bound_run(
+                    &goal.scope,
+                    &goal.id,
+                    1,
+                    "run-goal-corrupt",
+                    "support",
+                    "inspect",
+                )
+                .unwrap();
+            journal.conn.execute_batch(corrupt_goal).unwrap();
+            assert_eq!(
+                journal.gate_goal_run("run-goal-corrupt").unwrap(),
+                GoalRunGate::NeedsReview,
+                "{label}"
+            );
+            let error = journal
+                .start_step("run-goal-corrupt", "llm_call", &json!({}), None, None, 1)
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<GoalRunNeedsReview>().is_some(),
+                "{label}: {error:#}"
+            );
+            assert_eq!(
+                journal.run("run-goal-corrupt").unwrap().status,
+                "needs_review",
+                "{label}"
+            );
+            assert!(
+                journal.steps("run-goal-corrupt").unwrap().is_empty(),
+                "{label}"
+            );
+        }
+
+        let app = TempDir::new("goal-body-nul-size");
+        let journal = Journal::open(app.path()).unwrap();
+        let goal = journal
+            .create_goal(&mutation("create"), sample_goal())
+            .unwrap();
+        journal
+            .create_goal_bound_run(
+                &goal.scope,
+                &goal.id,
+                1,
+                "run-body-nul",
+                "support",
+                "inspect",
+            )
+            .unwrap();
+        journal
+            .conn
+            .execute(
+                "UPDATE goals SET body=?1",
+                [format!("\0{}", "x".repeat(65_536))],
+            )
+            .unwrap();
+        assert_eq!(
+            journal.gate_goal_run("run-body-nul").unwrap(),
+            GoalRunGate::NeedsReview
+        );
+        assert!(journal.steps("run-body-nul").unwrap().is_empty());
+
+        let app = TempDir::new("binding-types");
+        let journal = Journal::open(app.path()).unwrap();
+        for (run_id, binding) in [
+            (
+                "run-binding-blob",
+                rusqlite::types::Value::Blob(vec![0; 32]),
+            ),
+            (
+                "run-binding-large",
+                rusqlite::types::Value::Text("x".repeat(4097)),
+            ),
+            (
+                "run-binding-nul",
+                rusqlite::types::Value::Text(format!("\0{}", "x".repeat(4096))),
+            ),
+            (
+                "run-binding-multibyte",
+                rusqlite::types::Value::Text("é".repeat(2049)),
+            ),
+        ] {
+            journal.create_run(run_id, "support", "inspect").unwrap();
+            journal
+                .conn
+                .execute(
+                    "UPDATE runs SET goal_binding=?1 WHERE id=?2",
+                    rusqlite::params![binding, run_id],
+                )
+                .unwrap();
+            assert_eq!(
+                journal.gate_goal_run(run_id).unwrap(),
+                GoalRunGate::NeedsReview,
+                "{run_id}"
+            );
+            let error = journal
+                .start_step(run_id, "llm_call", &json!({}), None, None, 1)
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<GoalRunNeedsReview>().is_some(),
+                "{run_id}: {error:#}"
+            );
+            assert_eq!(
+                journal.run(run_id).unwrap().status,
+                "needs_review",
+                "{run_id}"
+            );
+            assert!(journal.steps(run_id).unwrap().is_empty(), "{run_id}");
+        }
+    }
+
+    #[test]
+    fn runs_schema_migrates_existing_null_bindings_without_rewriting_them() {
+        use rusqlite::Connection;
+        let app = TempDir::new("goal-run-migration");
+        let beater = app.path().join(".beater");
+        std::fs::create_dir_all(&beater).unwrap();
+        let conn = Connection::open(beater.join("journal.db")).unwrap();
+        conn.execute_batch("CREATE TABLE runs(id TEXT PRIMARY KEY, agent TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); INSERT INTO runs VALUES('legacy','support','running','inspect',1,1);").unwrap();
+        drop(conn);
+        let journal = super::Journal::open(app.path()).unwrap();
+        let binding: Option<String> = journal
+            .conn
+            .query_row(
+                "SELECT goal_binding FROM runs WHERE id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(binding.is_none());
+        assert_eq!(
+            journal.gate_goal_run("legacy").unwrap(),
+            super::GoalRunGate::Unbound
         );
     }
 }
