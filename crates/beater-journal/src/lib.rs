@@ -9,6 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+mod read_projection;
+pub use read_projection::{
+    GoalActivityCursor, GoalActivityPage, GoalActivityReceipt, GoalSummary, PreparationCounts,
+};
+
 const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Journal {
@@ -409,6 +414,8 @@ impl Journal {
               CREATE TABLE IF NOT EXISTS goal_events(
                 organization TEXT NOT NULL, project TEXT NOT NULL, environment TEXT NOT NULL, site TEXT NOT NULL,
                 goal_id TEXT NOT NULL, revision INTEGER NOT NULL, event TEXT NOT NULL, created_at INTEGER NOT NULL);
+              CREATE INDEX IF NOT EXISTS goal_events_scope_goal_revision
+                ON goal_events(organization, project, environment, site, goal_id, revision);
               CREATE TABLE IF NOT EXISTS goal_replays(
                 organization TEXT NOT NULL, project TEXT NOT NULL, environment TEXT NOT NULL, site TEXT NOT NULL,
                 actor TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NOT NULL, request_id TEXT NOT NULL,
