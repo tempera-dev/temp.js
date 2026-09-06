@@ -12,6 +12,7 @@ use crate::registry::{
     AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
     browser_session_dir, cleanup_stale_browser_sessions,
 };
+use crate::resume_contract::ToolResumeContract;
 use crate::trace_export;
 use beater_journal::Journal;
 
@@ -217,7 +218,8 @@ async fn resume_async(
                 }
 
                 // Fill in tool results: journaled ones verbatim; dangling ones
-                // re-run ONLY if the tool is declared idempotent (§5 rule 4).
+                // Replay requires the original declaration and current descriptor
+                // to agree. Mutable current configuration cannot bless old work.
                 let mut tool_results = Vec::new();
                 for tu in &tool_uses {
                     let (id, name) = (
@@ -240,13 +242,18 @@ async fn resume_async(
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
                         }
                         None => {
-                            if let Some(tool) = ctx.registry.get(name)
-                                && !tool.idempotent
-                            {
+                            if !tool_replay_matches_recorded_contract(
+                                run_id,
+                                name,
+                                id,
+                                &tu["input"],
+                                &steps,
+                                ctx.registry.resume_contract(name).as_ref(),
+                            ) {
                                 ctx.journal.set_run_status(run_id, "needs_review")?;
                                 println!(
                                     "run {run_id} needs review: tool {name} ({id}) may have executed \
-                                     before the crash and is not declared idempotent — not re-running"
+                                     before the crash and lacks an unchanged, originally idempotent replay contract"
                                 );
                                 close_browser_sessions_best_effort(ctx).await;
                                 return Ok(());
@@ -446,7 +453,30 @@ pub fn start_journaled_tool_call(
     attempt: i64,
     idempotency_key: Option<String>,
 ) -> Result<JournaledToolCall> {
-    let request = match &idempotency_key {
+    start_journaled_tool_call_with_contract(
+        journal,
+        run_id,
+        name,
+        tool_use_id,
+        input,
+        attempt,
+        idempotency_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_journaled_tool_call_with_contract(
+    journal: &Journal,
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    attempt: i64,
+    idempotency_key: Option<String>,
+    contract: Option<ToolResumeContract>,
+) -> Result<JournaledToolCall> {
+    let mut request = match &idempotency_key {
         Some(key) => json!({
             "name": name,
             "input": input,
@@ -455,6 +485,10 @@ pub fn start_journaled_tool_call(
         }),
         None => json!({"name": name, "input": input, "tool_use_id": tool_use_id}),
     };
+    if let Some(contract) = contract {
+        anyhow::ensure!(contract.is_valid(), "invalid tool resume contract");
+        request["resume_contract"] = serde_json::to_value(contract)?;
+    }
     let seq = journal.start_step(
         run_id,
         "tool_call",
@@ -499,7 +533,7 @@ async fn execute_tool_step(
     attempt: i64,
 ) -> Result<String> {
     let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
-    let call = start_journaled_tool_call(
+    let call = start_journaled_tool_call_with_contract(
         &ctx.journal,
         &ctx.run_id,
         name,
@@ -507,6 +541,7 @@ async fn execute_tool_step(
         input,
         attempt,
         idempotency_key,
+        ctx.registry.resume_contract(name),
     )?;
     match ctx
         .registry
@@ -528,10 +563,54 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
     (!tool_use_id.is_empty()).then(|| format!("beater:{run_id}:tool:{tool_use_id}"))
 }
 
+fn tool_replay_matches_recorded_contract(
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    steps: &[beater_journal::StepRow],
+    current: Option<&ToolResumeContract>,
+) -> bool {
+    let Some(current) =
+        current.filter(|value| value.is_valid() && value.idempotent && value.name == name)
+    else {
+        return false;
+    };
+    let Some(key) = tool_idempotency_key(run_id, tool_use_id) else {
+        return false;
+    };
+    let mut found = false;
+    for step in steps
+        .iter()
+        .filter(|step| step.kind == "tool_call" && step.tool_use_id.as_deref() == Some(tool_use_id))
+    {
+        found = true;
+        if step.tool_name.as_deref() != Some(name)
+            || step.request["name"].as_str() != Some(name)
+            || step.request["tool_use_id"].as_str() != Some(tool_use_id)
+            || step.request["input"] != *input
+            || step.request["idempotency_key"].as_str() != Some(key.as_str())
+            || step.attempt <= 0
+            || step.attempt == i64::MAX
+        {
+            return false;
+        }
+        let Ok(recorded) =
+            serde_json::from_value::<ToolResumeContract>(step.request["resume_contract"].clone())
+        else {
+            return false;
+        };
+        if !recorded.is_valid() || !recorded.idempotent || recorded != *current {
+            return false;
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::{resume, run, tool_idempotency_key};
-    use crate::registry::BeatboxConfig;
+    use crate::registry::{AgentConfig, BeatboxConfig, ToolRegistry};
     use beater_journal::Journal;
     use rusqlite::params;
     use serde_json::{Value, json};
@@ -1025,11 +1104,67 @@ def run(input):
         })
     }
 
+    fn remote_config(endpoint: &str, schema: Value) -> Value {
+        let url = reqwest::Url::parse(endpoint).unwrap();
+        let host = url.host_str().unwrap();
+        let egress = url
+            .port()
+            .map(|port| format!("{host}:{port}"))
+            .unwrap_or_else(|| host.to_string());
+        json!({
+            "name": "support",
+            "provider": "anthropic",
+            "model": "mock",
+            "system": "test",
+            "tools": [{
+                "kind": "remote_mcp",
+                "name": "crm.lookup",
+                "description": "Look up a contact.",
+                "inputSchema": schema,
+                "endpoint": endpoint,
+                "tool": "lookup",
+                "timeoutMs": 1000,
+                "egress": [egress],
+                "idempotent": true,
+            }],
+        })
+    }
+
     fn seed_interrupted_tool_run(app: &TempApp) {
-        seed_interrupted_tool_run_for(app, "echo", json!({"value": "ok"}));
+        seed_interrupted_tool_run_for_config(
+            app,
+            "echo",
+            json!({"value": "ok"}),
+            config(true),
+            BeatboxConfig::default(),
+        );
     }
 
     fn seed_interrupted_tool_run_for(app: &TempApp, name: &str, input: Value) {
+        seed_interrupted_tool_run_for_config(
+            app,
+            name,
+            input,
+            config(true),
+            BeatboxConfig::default(),
+        );
+    }
+
+    fn seed_interrupted_tool_run_for_config(
+        app: &TempApp,
+        name: &str,
+        input: Value,
+        config_value: Value,
+        beatbox: BeatboxConfig,
+    ) {
+        let config: AgentConfig = serde_json::from_value(config_value).unwrap();
+        let registry = ToolRegistry::build_with_beatbox(
+            &app.path().join("agents").join(&config.name),
+            &config.tools,
+            &beatbox,
+        )
+        .unwrap();
+        let contract = registry.resume_contract(name);
         let journal = Journal::open(app.path()).unwrap();
         journal
             .create_run("run-1", "support", &format!("call {name}"))
@@ -1050,16 +1185,17 @@ def run(input):
             .start_step("run-1", "llm_call", &request, None, None, 1)
             .unwrap();
         journal.complete_step("run-1", llm, &response).unwrap();
-        journal
-            .start_step(
-                "run-1",
-                "tool_call",
-                &json!({"name": name, "input": input, "tool_use_id": "toolu_1"}),
-                Some(name),
-                Some("toolu_1"),
-                1,
-            )
-            .unwrap();
+        super::start_journaled_tool_call_with_contract(
+            &journal,
+            "run-1",
+            name,
+            "toolu_1",
+            &input,
+            1,
+            super::tool_idempotency_key("run-1", "toolu_1"),
+            contract,
+        )
+        .unwrap();
         mark_run_stale(app, "run-1");
     }
 
@@ -1265,50 +1401,27 @@ def run(input):
     }
 
     #[test]
-    fn resume_turns_removed_tool_rerun_into_error_result() {
+    fn resume_parks_removed_tool_without_replaying_legacy_step() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("removed-tool");
         seed_interrupted_tool_run_for(&app, "old.echo", json!({"value": "ok"}));
-        let server = MockAnthropic::new(vec![json!({
-            "content": [{"type": "text", "text": "handled missing tool"}],
-            "stop_reason": "end_turn",
-        })]);
-        let _env = EnvGuard::set(&server.base_url);
+        let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
             Ok(config(true))
         })
         .unwrap();
-        let requests = server.join();
-
-        assert_eq!(requests.len(), 1);
-        let body: Value = serde_json::from_str(&requests[0]).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        let tool_result = &messages.last().unwrap()["content"][0];
-        assert_eq!(tool_result["tool_use_id"], "toolu_1");
-        assert_eq!(tool_result["is_error"], true);
-        assert!(
-            tool_result["content"]
-                .as_str()
-                .unwrap()
-                .contains("no tool named old.echo"),
-            "{tool_result}"
-        );
-
         let journal = Journal::open(app.path()).unwrap();
-        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
         let tool_steps: Vec<_> = journal
             .steps("run-1")
             .unwrap()
             .into_iter()
             .filter(|step| step.kind == "tool_call")
             .collect();
-        assert_eq!(tool_steps.len(), 2);
+        assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].tool_name.as_deref(), Some("old.echo"));
         assert_eq!(tool_steps[0].status, "started");
-        assert_eq!(tool_steps[1].tool_name.as_deref(), Some("old.echo"));
-        assert_eq!(tool_steps[1].status, "failed");
-        assert_eq!(tool_steps[1].attempt, 2);
     }
 
     #[test]
@@ -1560,10 +1673,41 @@ def run(input):
     }
 
     #[test]
+    fn resume_does_not_promote_original_non_idempotent_declaration() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("idempotence-promotion");
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "echo",
+            json!({"value": "ok"}),
+            config(false),
+            BeatboxConfig::default(),
+        );
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        let steps = journal.steps("run-1").unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].status, "started");
+        assert_eq!(steps[1].attempt, 1);
+        assert_eq!(steps[1].request["resume_contract"]["idempotent"], false);
+    }
+
+    #[test]
     fn resume_parks_interrupted_non_idempotent_tool_for_review() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("non-idempotent");
-        seed_interrupted_tool_run(&app);
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "echo",
+            json!({"value": "ok"}),
+            config(false),
+            BeatboxConfig::default(),
+        );
         let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
@@ -1582,6 +1726,98 @@ def run(input):
         assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].status, "started");
         assert_eq!(tool_steps[0].attempt, 1);
+    }
+
+    #[test]
+    fn resume_parks_config_or_schema_drift_before_any_replay() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for (label, current) in [
+            (
+                "endpoint",
+                remote_config(
+                    "http://127.0.0.1:19002/mcp",
+                    json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+                ),
+            ),
+            (
+                "schema",
+                remote_config(
+                    "http://127.0.0.1:19001/mcp",
+                    json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+                ),
+            ),
+        ] {
+            let app = TempApp::new(label);
+            let original = remote_config(
+                "http://127.0.0.1:19001/mcp",
+                json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+            );
+            seed_interrupted_tool_run_for_config(
+                &app,
+                "crm.lookup",
+                json!({"email": "a@example.test"}),
+                original,
+                BeatboxConfig::default(),
+            );
+            let _env = EnvGuard::set("http://127.0.0.1:9");
+            resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+                Ok(current.clone())
+            })
+            .unwrap();
+            let journal = Journal::open(app.path()).unwrap();
+            assert_eq!(
+                journal.run("run-1").unwrap().status,
+                "needs_review",
+                "{label}"
+            );
+            assert_eq!(journal.steps("run-1").unwrap().len(), 2, "{label}");
+        }
+    }
+
+    #[test]
+    fn resume_parks_legacy_or_malformed_contracts() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for malformed in [false, true] {
+            let app = TempApp::new(if malformed {
+                "malformed-contract"
+            } else {
+                "legacy-contract"
+            });
+            seed_interrupted_tool_run(&app);
+            let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
+            let raw_request: String = conn
+                .query_row(
+                    "SELECT request FROM steps WHERE run_id='run-1' AND kind='tool_call'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut request: Value = serde_json::from_str(&raw_request).unwrap();
+            if malformed {
+                request["resume_contract"] =
+                    json!({"version": 1, "name": "echo", "idempotent": true, "fingerprint": "bad"});
+            } else {
+                request.as_object_mut().unwrap().remove("resume_contract");
+            }
+            conn.execute(
+                "UPDATE steps SET request=?1 WHERE run_id='run-1' AND kind='tool_call'",
+                [request.to_string()],
+            )
+            .unwrap();
+            let _env = EnvGuard::set("http://127.0.0.1:9");
+            resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert_eq!(
+                Journal::open(app.path())
+                    .unwrap()
+                    .run("run-1")
+                    .unwrap()
+                    .status,
+                "needs_review"
+            );
+        }
     }
 
     #[test]
@@ -1832,7 +2068,6 @@ def run(input):
     fn resume_reruns_interrupted_idempotent_sandbox_tool_through_beatbox_job() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("sandbox-idempotent");
-        seed_interrupted_tool_run_for(&app, "fib_wasm", json!({"n": 10}));
         let anthropic = MockAnthropic::new(vec![json!({
             "content": [{"type": "text", "text": "done"}],
             "stop_reason": "end_turn",
@@ -1845,6 +2080,13 @@ def run(input):
             url: beatbox.base_url.clone(),
             api_key: None,
         };
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "fib_wasm",
+            json!({"n": 10}),
+            sandbox_config(true),
+            beatbox_config.clone(),
+        );
         let _env = EnvGuard::set(&anthropic.base_url);
 
         resume(app.path(), "run-1", None, beatbox_config, |_| {
@@ -1886,7 +2128,13 @@ def run(input):
     fn resume_parks_interrupted_non_idempotent_sandbox_tool_for_review() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("sandbox-non-idempotent");
-        seed_interrupted_tool_run_for(&app, "fib_wasm", json!({"n": 10}));
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "fib_wasm",
+            json!({"n": 10}),
+            sandbox_config(false),
+            BeatboxConfig::default(),
+        );
         let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {

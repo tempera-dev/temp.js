@@ -9,6 +9,7 @@ mod cpp_bridge;
 mod llm;
 mod ownership;
 mod registry;
+mod resume_contract;
 mod runner;
 mod trace_export;
 
