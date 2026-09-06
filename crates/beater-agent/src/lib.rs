@@ -8,6 +8,7 @@ mod anthropic;
 mod cpp_bridge;
 mod journal;
 mod llm;
+mod ownership;
 mod registry;
 mod runner;
 mod trace_export;

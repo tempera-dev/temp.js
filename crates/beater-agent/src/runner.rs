@@ -2,13 +2,13 @@
 //! reloads and every LLM/tool step is journaled before it executes.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::journal::Journal;
 use crate::llm::{LlmClient, LlmSelection};
+use crate::ownership::RunOwnership;
 use crate::registry::{
     AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
     browser_session_dir, cleanup_stale_browser_sessions,
@@ -17,7 +17,6 @@ use crate::trace_export;
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
-const LIVE_RUN_RESUME_GRACE: Duration = Duration::from_secs(30);
 
 struct Ctx {
     journal: Journal,
@@ -72,6 +71,8 @@ pub fn run(
     beatbox: BeatboxConfig,
     prompt: &str,
 ) -> Result<()> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let _ownership = RunOwnership::acquire(app_dir, &run_id)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     anyhow::ensure!(
         config.name == agent_name,
@@ -81,7 +82,6 @@ pub fn run(
     let llm = LlmSelection::from_config(&config)?;
     let client = LlmClient::from_provider(&llm.provider)?;
     let journal = Journal::open(app_dir)?;
-    let run_id = uuid::Uuid::new_v4().to_string();
     journal.create_run(&run_id, agent_name, prompt)?;
     println!("run {run_id}");
 
@@ -106,17 +106,12 @@ pub fn resume(
     beatbox: BeatboxConfig,
     load_config: impl Fn(&str) -> Result<Value>,
 ) -> Result<()> {
+    let _ownership = RunOwnership::acquire(app_dir, run_id)?;
     let journal = Journal::open(app_dir)?;
     let run = journal.run(run_id)?;
     if run.status == "completed" {
         println!("run {run_id} already completed");
         return Ok(());
-    }
-    if run.status == "running" && run.updated_at + LIVE_RUN_RESUME_GRACE.as_secs() as i64 > now() {
-        bail!(
-            "run {run_id} still appears active; wait at least {}s after its last journal update before resuming",
-            LIVE_RUN_RESUME_GRACE.as_secs()
-        );
     }
     cleanup_stale_browser_sessions(app_dir, run_id)
         .with_context(|| format!("cleaning stale browser sessions for run {run_id}"))?;
@@ -136,10 +131,6 @@ pub fn resume(
     let result = runtime()?.block_on(resume_async(&ctx, run, steps));
     export_run_trace_best_effort(app_dir, &ctx.run_id);
     result
-}
-
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
 }
 
 fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
@@ -539,7 +530,7 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_RUN_RESUME_GRACE, resume, run, tool_idempotency_key};
+    use super::{resume, run, tool_idempotency_key};
     use crate::journal::Journal;
     use crate::registry::BeatboxConfig;
     use rusqlite::params;
@@ -1123,8 +1114,7 @@ def run(input):
     }
 
     fn mark_run_stale(app: &TempApp, run_id: &str) {
-        let stale_updated_at =
-            chrono::Utc::now().timestamp() - LIVE_RUN_RESUME_GRACE.as_secs() as i64 - 1;
+        let stale_updated_at = chrono::Utc::now().timestamp() - 31;
         let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
         conn.execute(
             "UPDATE runs SET updated_at = ?2 WHERE id = ?1",
@@ -1725,20 +1715,36 @@ def run(input):
     }
 
     #[test]
-    fn resume_refuses_recently_updated_running_run() {
-        let app = TempApp::new("fresh-running-run");
+    fn resume_refuses_owned_running_run_before_loading_config() {
+        let app = TempApp::new("owned-running-run");
+        let _owner = crate::ownership::RunOwnership::acquire(app.path(), "run-1").unwrap();
         let journal = Journal::open(app.path()).unwrap();
         journal
             .create_run("run-1", "support", "still active")
             .unwrap();
 
         let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
-            panic!("fresh running guard should reject before loading config")
+            panic!("owned run should reject before loading config")
         })
         .unwrap_err();
 
-        assert!(format!("{err:#}").contains("still appears active"));
+        assert!(format!("{err:#}").contains("run ownership unavailable"));
         assert_eq!(journal.run("run-1").unwrap().status, "running");
+    }
+
+    #[test]
+    fn resume_without_owner_does_not_wait_for_timestamp_grace() {
+        let app = TempApp::new("unowned-fresh-run");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "interrupted")
+            .unwrap();
+        let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            anyhow::bail!("config loader reached after exclusive ownership")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("config loader reached"));
+        assert!(crate::ownership::RunOwnership::acquire(app.path(), "run-1").is_ok());
     }
 
     #[test]
