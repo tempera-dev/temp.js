@@ -8,7 +8,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::journal::{Journal, RunRow, StepRow};
+use beater_journal::{Journal, RunRow, StepRow};
 
 const EXPORT_URL_ENV: &str = "BEATER_TRACE_EXPORT_URL";
 const API_KEY_ENV: &str = "BEATER_API_KEY";
@@ -530,7 +530,7 @@ fn status(status: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::Journal;
+    use beater_journal::Journal;
     use std::fs;
     use std::path::{Path, PathBuf};
 

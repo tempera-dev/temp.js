@@ -4,6 +4,7 @@ members = [
   "crates/beater-cli",
   "crates/beater-runtime",
   "crates/beater-agent",
+  "crates/beater-journal",
   "crates/beater-py",
   "crates/beater-connect",
 ]
@@ -59,6 +60,7 @@ uuid = { version = "1", features = ["v4"] }
 # workspace crates
 beater-runtime = { path = "crates/beater-runtime" }
 beater-agent = { path = "crates/beater-agent" }
+beater-journal = { path = "crates/beater-journal" }
 beater-py = { path = "crates/beater-py" }
 beater-connect = { path = "crates/beater-connect" }
 beater-browser = { git = "https://github.com/jadenfix/beater", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::journal::Journal;
 use crate::llm::{LlmClient, LlmSelection};
 use crate::ownership::RunOwnership;
 use crate::registry::{
@@ -14,6 +13,7 @@ use crate::registry::{
     browser_session_dir, cleanup_stale_browser_sessions,
 };
 use crate::trace_export;
+use beater_journal::Journal;
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
@@ -141,8 +141,8 @@ fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
 
 async fn resume_async(
     ctx: &Ctx,
-    run: crate::journal::RunRow,
-    steps: Vec<crate::journal::StepRow>,
+    run: beater_journal::RunRow,
+    steps: Vec<beater_journal::StepRow>,
 ) -> Result<()> {
     let run_id = ctx.run_id.as_str();
     // Rebuild conversation state from the journal. The last llm_call's request
@@ -531,8 +531,8 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{resume, run, tool_idempotency_key};
-    use crate::journal::Journal;
     use crate::registry::BeatboxConfig;
+    use beater_journal::Journal;
     use rusqlite::params;
     use serde_json::{Value, json};
     use std::collections::VecDeque;

@@ -268,6 +268,7 @@ dependencies = [
  "beatbox-client",
  "beater-browser",
  "beater-browser-playwright",
+ "beater-journal",
  "beater-py",
  "chrono",
  "cxx",
@@ -327,6 +328,17 @@ dependencies = [
 name = "beater-connect"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "beater-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "serde",
  "serde_json",
 ]
 
