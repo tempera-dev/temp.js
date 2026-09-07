@@ -238,6 +238,19 @@ fn decision_package_schema() -> Value {
     })
 }
 
+fn read_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "decision_id", "expected_revision"],
+        "properties": {
+            "version": {"type": "integer", "const": TOOL_VERSION},
+            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "expected_revision": {"type": "integer", "minimum": 1, "maximum": 1_000_000_000}
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{APPEND_TOOL_NAME, READ_TOOL_NAME, rejects_configured_name, tool_definitions};
@@ -272,17 +285,4 @@ mod tests {
         );
         assert!(evidence["allOf"].is_array());
     }
-}
-
-fn read_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["version", "decision_id", "expected_revision"],
-        "properties": {
-            "version": {"type": "integer", "const": TOOL_VERSION},
-            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "expected_revision": {"type": "integer", "minimum": 1, "maximum": 1_000_000_000}
-        }
-    })
 }
