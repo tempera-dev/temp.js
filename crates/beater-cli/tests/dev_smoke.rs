@@ -67,8 +67,18 @@ fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
     // Do not inherit a developer's trace/export credentials or endpoints: this
     // smoke owns only its loopback model fixture and must never export private
     // journal/tool content to an ambient collector.
-    let output = Command::new(beater_bin(&workspace))
-        .env_clear()
+    let mut command = Command::new(beater_bin(&workspace));
+    command.env_clear();
+    #[cfg(target_os = "macos")]
+    if std::path::Path::new("/Library/Developer/CommandLineTools/Library/Frameworks").is_dir() {
+        // The embedded Python dylib uses @rpath; restore only the trusted
+        // system framework directory required to launch the candidate binary.
+        command.env(
+            "DYLD_FRAMEWORK_PATH",
+            "/Library/Developer/CommandLineTools/Library/Frameworks",
+        );
+    }
+    let output = command
         .args(["agent", "run-goal", "--app"])
         .arg(&app)
         .args([
