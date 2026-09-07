@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::decision_tools;
 use crate::llm::{LlmClient, LlmSelection};
 use crate::ownership::RunOwnership;
 use crate::registry::{
@@ -65,6 +66,13 @@ fn setup(
     }
     let config: AgentConfig = serde_json::from_value(config_value)
         .context("agent.ts default export did not match defineAgent shape")?;
+    anyhow::ensure!(
+        config
+            .tools
+            .iter()
+            .all(|tool| !decision_tools::rejects_configured_name(&tool.name)),
+        "agent configuration cannot claim a runner-private decision tool name"
+    );
     let agent_dir = app_dir.join("agents").join(&config.name);
     let registry = ToolRegistry::build_with_beatbox_and_browser_session_dir(
         &agent_dir,
@@ -311,13 +319,26 @@ async fn resume_async(
                         tu["id"].as_str().unwrap_or_default(),
                         tu["name"].as_str().unwrap_or_default(),
                     );
-                    let done = steps.iter().find(|s| {
-                        s.kind == "tool_call"
-                            && s.status == "completed"
-                            && s.tool_use_id.as_deref() == Some(id)
-                    });
-                    let tool_result = match done {
-                        Some(s) => {
+                    let done: Vec<_> = steps
+                        .iter()
+                        .filter(|s| {
+                            s.kind == "tool_call"
+                                && s.status == "completed"
+                                && s.tool_use_id.as_deref() == Some(id)
+                        })
+                        .collect();
+                    let tool_result = match done.as_slice() {
+                        [s] if completed_tool_matches_recorded_contract(
+                            run_id,
+                            name,
+                            id,
+                            &tu["input"],
+                            s,
+                            decision_tools::resume_contract(name)
+                                .as_ref()
+                                .or(ctx.registry.resume_contract(name).as_ref()),
+                        ) =>
+                        {
                             let content = s
                                 .result
                                 .as_ref()
@@ -326,14 +347,16 @@ async fn resume_async(
                                 .to_string();
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
                         }
-                        None => {
+                        [] => {
+                            let private_contract = decision_tools::resume_contract(name);
+                            let registry_contract = ctx.registry.resume_contract(name);
                             if !tool_replay_matches_recorded_contract(
                                 run_id,
                                 name,
                                 id,
                                 &tu["input"],
                                 &steps,
-                                ctx.registry.resume_contract(name).as_ref(),
+                                private_contract.as_ref().or(registry_contract.as_ref()),
                             ) {
                                 ctx.journal.set_run_status(run_id, "needs_review")?;
                                 println!(
@@ -366,15 +389,29 @@ async fn resume_async(
                                     return Ok(());
                                 }
                                 Err(e) => {
-                                    println!("← tool error: {e:#}");
+                                    if decision_tools::resume_contract(name).is_some() {
+                                        println!(
+                                            "← tool {name} rejected (decision content redacted)"
+                                        );
+                                    } else {
+                                        println!("← tool error: {e:#}");
+                                    }
                                     json!({
                                         "type": "tool_result",
                                         "tool_use_id": id,
-                                        "content": format!("Error: {e:#}"),
+                                        "content": if decision_tools::resume_contract(name).is_some() { "Error: DECISION_AUDIT_REJECTED".to_string() } else { format!("Error: {e:#}") },
                                         "is_error": true,
                                     })
                                 }
                             }
+                        }
+                        _ => {
+                            ctx.journal.set_run_status(run_id, "needs_review")?;
+                            println!(
+                                "run {run_id} needs review: completed tool {name} ({id}) is ambiguous or does not exactly match its recorded declaration"
+                            );
+                            close_browser_sessions_best_effort(ctx).await;
+                            return Ok(());
                         }
                     };
                     tool_results.push(tool_result);
@@ -412,12 +449,23 @@ pub fn list_runs(app_dir: &Path) -> Result<()> {
 
 async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i64) -> Result<()> {
     for _ in 0..MAX_LOOP_STEPS {
+        let mut tools = ctx.registry.api_tools();
+        match ctx.journal.gate_goal_run(&ctx.run_id)? {
+            GoalRunGate::Current(_) => {
+                let definitions = tools
+                    .as_array_mut()
+                    .context("tool registry returned a non-array definition")?;
+                definitions.extend(decision_tools::tool_definitions());
+            }
+            GoalRunGate::Unbound => {}
+            GoalRunGate::NeedsReview => return Err(GoalRunNeedsReview.into()),
+        }
         let body = json!({
             "model": ctx.model,
             "max_tokens": MAX_TOKENS,
             "system": ctx.config.system,
             "thinking": {"type": "adaptive"},
-            "tools": ctx.registry.api_tools(),
+            "tools": tools,
             "messages": messages,
         });
 
@@ -464,11 +512,19 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                     saw_tool_use = true;
                     let id = block["id"].as_str().unwrap_or_default();
                     let name = block["name"].as_str().unwrap_or_default();
-                    println!("→ tool {name} {}", block["input"]);
+                    if decision_tools::resume_contract(name).is_some() {
+                        println!("→ tool {name} [runner-private decision input redacted]");
+                    } else {
+                        println!("→ tool {name} {}", block["input"]);
+                    }
                     let result = execute_tool_step(ctx, name, id, &block["input"], 1).await;
                     match result {
                         Ok(content) => {
-                            println!("← {content}");
+                            if decision_tools::resume_contract(name).is_some() {
+                                println!("← tool {name} completed (decision content redacted)");
+                            } else {
+                                println!("← {content}");
+                            }
                             tool_results.push(json!({
                                 "type": "tool_result", "tool_use_id": id, "content": content,
                             }));
@@ -480,10 +536,15 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                             return Ok(());
                         }
                         Err(e) => {
-                            println!("← tool error: {e:#}");
+                            let private = decision_tools::resume_contract(name).is_some();
+                            if private {
+                                println!("← tool {name} rejected (decision content redacted)");
+                            } else {
+                                println!("← tool error: {e:#}");
+                            }
                             tool_results.push(json!({
                                 "type": "tool_result", "tool_use_id": id,
-                                "content": format!("Error: {e:#}"), "is_error": true,
+                                "content": if private { "Error: DECISION_AUDIT_REJECTED".to_string() } else { format!("Error: {e:#}") }, "is_error": true,
                             }));
                         }
                     }
@@ -617,8 +678,29 @@ async fn execute_tool_step(
     input: &Value,
     attempt: i64,
 ) -> Result<String> {
+    let private_tool = decision_tools::resume_contract(name);
+    if private_tool.is_some() {
+        match redact_private_error(ctx.journal.gate_goal_run(&ctx.run_id))? {
+            GoalRunGate::Current(_) => {}
+            GoalRunGate::Unbound => {
+                bail!("runner-private decision tools require a current goal-bound run")
+            }
+            GoalRunGate::NeedsReview => return Err(GoalRunNeedsReview.into()),
+        }
+        // Strict parsing happens before `start_step`, so malformed package
+        // bodies cannot become durable tool requests.
+        match name {
+            decision_tools::APPEND_TOOL_NAME => {
+                redact_private_error(decision_tools::validate_append(input))?
+            }
+            decision_tools::READ_TOOL_NAME => {
+                redact_private_error(decision_tools::validate_read(input))?
+            }
+            _ => unreachable!(),
+        }
+    }
     let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
-    let call = start_journaled_tool_call_with_contract(
+    let call = redact_private_error(start_journaled_tool_call_with_contract(
         &ctx.journal,
         &ctx.run_id,
         name,
@@ -626,8 +708,49 @@ async fn execute_tool_step(
         input,
         attempt,
         idempotency_key,
-        ctx.registry.resume_contract(name),
-    )?;
+        private_tool.or_else(|| ctx.registry.resume_contract(name)),
+    ))?;
+    if decision_tools::resume_contract(name).is_some() {
+        let projection = match name {
+            decision_tools::APPEND_TOOL_NAME => {
+                decision_tools::append(&ctx.journal, &ctx.run_id, tool_use_id, input)
+            }
+            decision_tools::READ_TOOL_NAME => {
+                decision_tools::read(&ctx.journal, &ctx.run_id, input)
+            }
+            _ => unreachable!(),
+        };
+        return match projection {
+            Ok(projection) => {
+                let result = redact_private_error(
+                    serde_json::to_string(&projection).map_err(anyhow::Error::from),
+                )?;
+                redact_private_error(complete_journaled_tool_call(
+                    &ctx.journal,
+                    &ctx.run_id,
+                    call.seq,
+                    &result,
+                ))?;
+                Ok(result)
+            }
+            Err(error) => {
+                redact_private_error(fail_journaled_tool_call(
+                    &ctx.journal,
+                    &ctx.run_id,
+                    call.seq,
+                    "DECISION_AUDIT_REJECTED",
+                ))?;
+                if matches!(
+                    redact_private_error(ctx.journal.gate_goal_run(&ctx.run_id))?,
+                    GoalRunGate::NeedsReview
+                ) {
+                    return Err(GoalRunNeedsReview.into());
+                }
+                let _ = error;
+                bail!("DECISION_AUDIT_REJECTED")
+            }
+        };
+    }
     match ctx
         .registry
         .execute_with_context(name, input, &call.context)
@@ -642,6 +765,35 @@ async fn execute_tool_step(
             Err(e)
         }
     }
+}
+
+fn redact_private_error<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if is_review_error(&error) {
+            error
+        } else {
+            anyhow::anyhow!("DECISION_AUDIT_REJECTED")
+        }
+    })
+}
+
+fn completed_tool_matches_recorded_contract(
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    step: &beater_journal::StepRow,
+    current: Option<&ToolResumeContract>,
+) -> bool {
+    step.status == "completed"
+        && tool_replay_matches_recorded_contract(
+            run_id,
+            name,
+            tool_use_id,
+            input,
+            std::slice::from_ref(step),
+            current,
+        )
 }
 
 fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
@@ -694,7 +846,7 @@ fn tool_replay_matches_recorded_contract(
 
 #[cfg(test)]
 mod tests {
-    use super::{resume, run, tool_idempotency_key};
+    use super::{resume, run, run_for_goal, tool_idempotency_key};
     use crate::registry::{AgentConfig, BeatboxConfig, ToolRegistry};
     use beater_journal::Journal;
     use rusqlite::params;
@@ -1597,6 +1749,378 @@ def run(input):
         }
     }
 
+    fn decision_package_input(revision: i64, correction_of: Option<i64>) -> Value {
+        json!({
+            "version": 1,
+            "expected_revision": revision - 1,
+            "package": {
+                "version": 1,
+                "decision_id": "decision-a",
+                "revision": revision,
+                "domain": "software",
+                "question": "Record a local decision?",
+                "object_references": [], "evidence": [], "graph_context": null,
+                "policy_references": [], "calculation_references": [], "model_references": [], "producer_references": [],
+                "options": ["record"], "constraints": ["local-only"],
+                "rationale": "Preserve bounded local history.",
+                "reviews": [], "authorization_observations": [], "effect_attempts": [], "acknowledgements": [], "outcomes": [], "reconciliations": [],
+                "correction_of": correction_of.map(|previous| json!({"decision_id": "decision-a", "revision": previous})),
+                "successor_to": null,
+                "verification_ceiling": "RecordedOnly",
+                "execution_authority": "None"
+            }
+        })
+    }
+
+    #[test]
+    fn goal_runner_appends_corrects_reads_and_reopens_decision_history() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-tools");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let server = MockAnthropic::new(vec![
+            json!({"content": [{"type":"tool_use", "id":"decision-append-1", "name":"decision_audit_append", "input": decision_package_input(1, None)}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"tool_use", "id":"decision-append-2", "name":"decision_audit_append", "input": decision_package_input(2, Some(1))}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"tool_use", "id":"decision-read-2", "name":"decision_audit_read", "input": {"version":1, "decision_id":"decision-a", "expected_revision":2}}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"text", "text":"recorded"}], "stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(server.join().len(), 4);
+        drop(journal);
+        let reopened = Journal::open(app.path()).unwrap();
+        let history = reopened
+            .decision_audit(&request.scope, "decision-a")
+            .unwrap();
+        assert_eq!(history.current_revision, 2);
+        assert_eq!(history.events.len(), 2);
+        assert_eq!(
+            history.events[1]
+                .package
+                .correction_of
+                .as_ref()
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(reopened.run(&request.run_id).unwrap().status, "completed");
+    }
+
+    #[test]
+    fn stale_goal_before_private_append_keeps_no_decision_event() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-stale-before-append");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let app_path = app.path().to_path_buf();
+        let scope = request.scope.clone();
+        let server = MockAnthropic::before_response(
+            vec![
+                json!({"content": [{"type":"tool_use", "id":"decision-append", "name":"decision_audit_append", "input": decision_package_input(1, None)}], "stop_reason":"tool_use"}),
+            ],
+            move || revise_test_goal(&Journal::open(&app_path).unwrap(), &scope),
+        );
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_private_package_never_creates_a_tool_step_or_decision_event() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-invalid-before-step");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let mut invalid = decision_package_input(1, None);
+        let canary = "PRIVATE_DECISION_CANARY";
+        invalid["package"]["question"] = json!(format!("{canary}{}", "x".repeat(4_097)));
+        let server = MockAnthropic::new(vec![
+            json!({"content": [{"type":"tool_use", "id":"invalid-private", "name":"decision_audit_append", "input": invalid}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"text", "text":"handled"}], "stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let replay: Value = serde_json::from_str(&requests[1]).unwrap();
+        let result = &replay["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        assert_eq!(result["tool_use_id"], "invalid-private");
+        assert_eq!(result["content"], "Error: DECISION_AUDIT_REJECTED");
+        assert!(
+            !result.to_string().contains(canary),
+            "private rejection must not echo into tool result"
+        );
+        assert!(
+            journal.steps(&request.run_id).unwrap().iter().any(|step| {
+                step.kind == "llm_call"
+                    && step
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.to_string().contains(canary))
+            }),
+            "original private model response is retained in the journal"
+        );
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 2);
+        assert!(
+            journal
+                .steps(&request.run_id)
+                .unwrap()
+                .iter()
+                .all(|step| step.kind != "tool_call")
+        );
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_private_authority_and_version_never_create_tool_steps() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for (label, mut input) in [
+            ("authority", decision_package_input(1, None)),
+            ("version", decision_package_input(1, None)),
+        ] {
+            if label == "authority" {
+                input["package"]["execution_authority"] = json!("Execute");
+            } else {
+                input["version"] = json!(2);
+            }
+            let app = TempApp::new(&format!("decision-invalid-{label}"));
+            let journal = Journal::open(app.path()).unwrap();
+            let request = create_goal_request(&journal);
+            let server = MockAnthropic::new(vec![
+                json!({"content":[{"type":"tool_use","id":"invalid","name":"decision_audit_append","input":input}],"stop_reason":"tool_use"}),
+                json!({"content":[{"type":"text","text":"handled"}],"stop_reason":"end_turn"}),
+            ]);
+            let _env = EnvGuard::set(&server.base_url);
+            run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert!(
+                journal
+                    .steps(&request.run_id)
+                    .unwrap()
+                    .iter()
+                    .all(|step| step.kind != "tool_call")
+            );
+        }
+    }
+
+    #[test]
+    fn private_append_cas_and_replay_conflict_preserve_one_revision() {
+        let app = TempApp::new("decision-cas-replay");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                request.expected_revision,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        let first = decision_package_input(1, None);
+        crate::decision_tools::append(&journal, &request.run_id, "same-id", &first).unwrap();
+        assert_eq!(
+            crate::decision_tools::append(&journal, &request.run_id, "same-id", &first)
+                .unwrap()
+                .current_revision,
+            1
+        );
+        let mut changed = first.clone();
+        changed["package"]["question"] = json!("changed");
+        assert!(
+            crate::decision_tools::append(&journal, &request.run_id, "same-id", &changed).is_err()
+        );
+        let mut conflict = decision_package_input(2, Some(1));
+        conflict["expected_revision"] = json!(0);
+        assert!(
+            crate::decision_tools::append(&journal, &request.run_id, "new-id", &conflict).is_err()
+        );
+        assert_eq!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .current_revision,
+            1
+        );
+    }
+
+    #[test]
+    fn private_read_refuses_a_different_current_goal_after_retaining_history() {
+        let app = TempApp::new("decision-read-current-goal");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                1,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        crate::decision_tools::append(
+            &journal,
+            &request.run_id,
+            "append",
+            &decision_package_input(1, None),
+        )
+        .unwrap();
+        revise_test_goal(&journal, &request.scope);
+        assert!(
+            crate::decision_tools::read(
+                &journal,
+                &request.run_id,
+                &json!({"version": 1, "decision_id": "decision-a", "expected_revision": 1})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_private_read_rejects_another_goal_in_the_same_scope_without_leaking_it() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-read-foreign-goal");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let foreign_goal = beater_journal::Goal {
+            id: "other-goal".into(),
+            scope: request.scope.clone(),
+            revision: 1,
+            objective: "Keep foreign decision private".into(),
+            playbook: beater_journal::PlaybookIdentity {
+                id: "generic-preparation".into(),
+                digest: "b".repeat(64),
+            },
+            parameters: Default::default(),
+        };
+        journal
+            .create_goal(
+                &beater_journal::GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "foreign-create".into(),
+                    operation: "create".into(),
+                },
+                foreign_goal,
+            )
+            .unwrap();
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                "other-goal",
+                1,
+                "other-run",
+                "support",
+                "foreign",
+            )
+            .unwrap();
+        let mut foreign = decision_package_input(1, None);
+        foreign["package"]["question"] = json!("FOREIGN_DECISION_CANARY");
+        crate::decision_tools::append(&journal, "other-run", "foreign-append", &foreign).unwrap();
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"tool_use","id":"foreign-read","name":"decision_audit_read","input":{"version":1,"decision_id":"decision-a","expected_revision":1}}],"stop_reason":"tool_use"}),
+            json!({"content":[{"type":"text","text":"held"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+        let replay: Value = serde_json::from_str(&requests[1]).unwrap();
+        let result = &replay["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        assert_eq!(result["tool_use_id"], "foreign-read");
+        assert_eq!(result["content"], "Error: DECISION_AUDIT_REJECTED");
+        assert!(!result.to_string().contains("FOREIGN_DECISION_CANARY"));
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "completed");
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .events[0]
+                .package
+                .question
+                .contains("FOREIGN_DECISION_CANARY"),
+            "general privileged local history remains intact"
+        );
+        let rejected = journal
+            .steps(&request.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|step| step.tool_use_id.as_deref() == Some("foreign-read"))
+            .unwrap();
+        assert_eq!(rejected.status, "failed");
+        assert_eq!(rejected.result.unwrap()["error"], "DECISION_AUDIT_REJECTED");
+    }
+
+    #[test]
+    fn configured_private_name_is_rejected_before_run_creation() {
+        let app = TempApp::new("decision-name-collision");
+        let error = run(app.path(), "support", json!({"name":"support","provider":"anthropic","model":"x","tools":[{"kind":"rust","name":"decision_audit_append"}]}), None, BeatboxConfig::default(), "x").unwrap_err();
+        assert!(format!("{error:#}").contains("runner-private decision tool name"));
+        assert!(
+            Journal::open(app.path())
+                .unwrap()
+                .list_runs()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unbound_runner_does_not_advertise_or_execute_private_tools() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-unbound");
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"tool_use","id":"forged","name":"decision_audit_append","input":decision_package_input(1, None)}],"stop_reason":"tool_use"}),
+            json!({"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run(
+            app.path(),
+            "support",
+            config(true),
+            None,
+            BeatboxConfig::default(),
+            "x",
+        )
+        .unwrap();
+        let requests = server.join();
+        assert!(!requests[0].contains("decision_audit_append"));
+        let journal = Journal::open(app.path()).unwrap();
+        let (_, steps) = journal.list_runs().unwrap().pop().unwrap();
+        assert_eq!(steps, 2);
+    }
+
     fn revise_test_goal(journal: &Journal, scope: &beater_journal::GoalScope) {
         use beater_journal::{GoalMutation, GoalPatch};
         journal
@@ -2126,6 +2650,127 @@ def run(input):
                 "needs_review"
             );
         }
+    }
+
+    #[test]
+    fn resume_parks_duplicate_completed_tool_use_ids_without_reissue_or_replay() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("duplicate-completed-tool-id");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "resume safely")
+            .unwrap();
+        let llm = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"messages": [{"role":"user","content":"resume safely"}]}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        journal.complete_step("run-1", llm, &json!({"content":[{"type":"tool_use","id":"duplicated","name":"echo","input":{"value":"x"}}],"stop_reason":"tool_use"})).unwrap();
+        let input = json!({"value":"x"});
+        let agent: AgentConfig = serde_json::from_value(config(true)).unwrap();
+        let registry = ToolRegistry::build_with_beatbox(
+            &app.path().join("agents/support"),
+            &agent.tools,
+            &BeatboxConfig::default(),
+        )
+        .unwrap();
+        let contract = registry.resume_contract("echo").unwrap();
+        for (attempt, content) in [(1, "historical-one"), (2, "historical-two")] {
+            let call = super::start_journaled_tool_call_with_contract(
+                &journal,
+                "run-1",
+                "echo",
+                "duplicated",
+                &input,
+                attempt,
+                super::tool_idempotency_key("run-1", "duplicated"),
+                Some(contract.clone()),
+            )
+            .unwrap();
+            journal
+                .complete_step("run-1", call.seq, &json!({"content":content}))
+                .unwrap();
+        }
+        let completed: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.kind == "tool_call")
+            .collect();
+        assert!(
+            completed
+                .iter()
+                .all(|step| super::completed_tool_matches_recorded_contract(
+                    "run-1",
+                    "echo",
+                    "duplicated",
+                    &input,
+                    step,
+                    Some(&contract)
+                ))
+        );
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"text","text":"mutant-only"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let steps = journal.steps("run-1").unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        assert_eq!(
+            steps.len(),
+            3,
+            "no model reissue or tool replay may be recorded"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.kind == "tool_call" && step.status == "completed")
+                .count(),
+            2,
+            "retain both ambiguous historical outcomes"
+        );
+    }
+
+    #[test]
+    fn resume_replays_one_valid_completed_tool_result_then_reaches_end_turn() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("one-completed-tool-id");
+        seed_interrupted_tool_run(&app);
+        let journal = Journal::open(app.path()).unwrap();
+        let step = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .find(|step| step.kind == "tool_call")
+            .unwrap();
+        journal
+            .complete_step("run-1", step.seq, &json!({"content":"cached-result"}))
+            .unwrap();
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("cached-result"));
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        assert_eq!(
+            journal.steps("run-1").unwrap().len(),
+            3,
+            "cached result must not replay the tool effect"
+        );
     }
 
     #[test]

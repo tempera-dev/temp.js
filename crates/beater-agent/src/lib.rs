@@ -6,6 +6,7 @@
 
 mod anthropic;
 mod cpp_bridge;
+mod decision_tools;
 mod llm;
 mod ownership;
 mod registry;

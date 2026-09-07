@@ -317,9 +317,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "beater-agent",
+ "beater-journal",
  "beater-py",
  "beater-runtime",
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

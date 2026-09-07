@@ -12,7 +12,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 pub mod decision_audit;
 pub use decision_audit::{
     DecisionAuditEventV1, DecisionAuditProjectionV1, DecisionDomain, DecisionPackageV1,
-    ExecutionAuthority, VerificationCeiling, verify_decision_audit_event,
+    ExecutionAuthority, VerificationCeiling, validate_decision_append_request,
+    validate_decision_package_v1, validate_decision_read_request, verify_decision_audit_event,
 };
 mod read_projection;
 mod storage;

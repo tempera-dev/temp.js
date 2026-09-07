@@ -487,6 +487,31 @@ fn validate_package(package: &DecisionPackageV1) -> Result<()> {
     Ok(())
 }
 
+/// Validates a closed v1 package without opening a journal transaction.
+/// This is integrity and bounded-shape validation only; it grants no authority.
+pub fn validate_decision_package_v1(package: &DecisionPackageV1) -> Result<()> {
+    validate_package(package)
+}
+
+/// Validates append coordinates before a caller records a durable request.
+pub fn validate_decision_append_request(expected_revision: i64) -> Result<()> {
+    ensure!(
+        (0..=MAX_REVISION).contains(&expected_revision),
+        "invalid expected decision revision"
+    );
+    Ok(())
+}
+
+/// Validates an exact read coordinate before a caller records a durable request.
+pub fn validate_decision_read_request(decision_id: &str, expected_revision: i64) -> Result<()> {
+    ensure!(valid_identifier(decision_id), "invalid decision id");
+    ensure!(
+        (1..=MAX_REVISION).contains(&expected_revision),
+        "invalid expected decision revision"
+    );
+    Ok(())
+}
+
 impl Journal {
     fn initialize_decision_audit(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         tx.execute_batch(
@@ -516,9 +541,7 @@ impl Journal {
             GoalRunGate::Unbound => {
                 anyhow::bail!("decision audit requires a current goal-bound run")
             }
-            GoalRunGate::NeedsReview => {
-                anyhow::bail!("decision audit requires a current goal-bound run")
-            }
+            GoalRunGate::NeedsReview => return Err(crate::GoalRunNeedsReview.into()),
         };
         let body: String = tx.query_row(
             "SELECT body FROM goals WHERE organization=?1 AND project=?2 AND environment=?3 AND site=?4 AND id=?5",
@@ -710,6 +733,39 @@ impl Journal {
         let result = Self::read_decision_projection_in_tx(&tx, scope, decision_id)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Reads a decision only while the run's exact current goal binding and the
+    /// decision's recorded binding are observed in one SQLite transaction. This
+    /// is a transaction linearization point, not a promise about later changes.
+    pub fn current_goal_run_decision_audit(
+        &self,
+        run_id: &str,
+        decision_id: &str,
+        expected_revision: i64,
+    ) -> Result<DecisionAuditProjectionV1> {
+        ensure!(valid_identifier(run_id), "invalid decision read run id");
+        ensure!(valid_identifier(decision_id), "invalid decision id");
+        ensure!(
+            (1..=MAX_REVISION).contains(&expected_revision),
+            "invalid expected decision revision"
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        Self::initialize_decision_audit(&tx)?;
+        let (binding, _, _) = Self::current_decision_binding(&tx, run_id)?;
+        let projection = Self::read_decision_projection_in_tx(&tx, &binding.scope, decision_id)?;
+        ensure!(
+            projection.run_id == run_id
+                && projection.goal_id == binding.goal_id
+                && projection.goal_revision == binding.goal_revision,
+            "decision read is not bound to the current goal revision"
+        );
+        ensure!(
+            projection.current_revision == expected_revision,
+            "decision read revision changed; exact historical replay is unavailable"
+        );
+        tx.commit()?;
+        Ok(projection)
     }
 
     fn read_decision_projection_in_tx(
