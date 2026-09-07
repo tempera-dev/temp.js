@@ -69,15 +69,7 @@ fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
     // journal/tool content to an ambient collector.
     let mut command = Command::new(beater_bin(&workspace));
     command.env_clear();
-    #[cfg(target_os = "macos")]
-    if std::path::Path::new("/Library/Developer/CommandLineTools/Library/Frameworks").is_dir() {
-        // The embedded Python dylib uses @rpath; restore only the trusted
-        // system framework directory required to launch the candidate binary.
-        command.env(
-            "DYLD_FRAMEWORK_PATH",
-            "/Library/Developer/CommandLineTools/Library/Frameworks",
-        );
-    }
+    restore_candidate_loader_environment(&mut command);
     let output = command
         .args(["agent", "run-goal", "--app"])
         .arg(&app)
@@ -149,6 +141,24 @@ fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
     let model_projection: Value = serde_json::from_str(result["content"].as_str().unwrap())
         .expect("parse replayed read projection");
     assert_eq!(model_projection, persisted);
+}
+
+fn restore_candidate_loader_environment(command: &mut Command) {
+    #[cfg(target_os = "macos")]
+    if std::path::Path::new("/Library/Developer/CommandLineTools/Library/Frameworks").is_dir() {
+        // The embedded Python dylib uses @rpath; restore only this trusted
+        // system framework directory required to launch the candidate binary.
+        command.env(
+            "DYLD_FRAMEWORK_PATH",
+            "/Library/Developer/CommandLineTools/Library/Frameworks",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH").filter(|path| !path.is_empty()) {
+        // CI selected and linked this exact libpython search path at build time.
+        // Do not restore any other parent environment state.
+        command.env("LD_LIBRARY_PATH", path);
+    }
 }
 
 fn decision_append_input() -> Value {
