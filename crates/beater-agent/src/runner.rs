@@ -2007,6 +2007,82 @@ def run(input):
     }
 
     #[test]
+    fn live_private_read_rejects_another_goal_in_the_same_scope_without_leaking_it() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-read-foreign-goal");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let foreign_goal = beater_journal::Goal {
+            id: "other-goal".into(),
+            scope: request.scope.clone(),
+            revision: 1,
+            objective: "Keep foreign decision private".into(),
+            playbook: beater_journal::PlaybookIdentity {
+                id: "generic-preparation".into(),
+                digest: "b".repeat(64),
+            },
+            parameters: Default::default(),
+        };
+        journal
+            .create_goal(
+                &beater_journal::GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "foreign-create".into(),
+                    operation: "create".into(),
+                },
+                foreign_goal,
+            )
+            .unwrap();
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                "other-goal",
+                1,
+                "other-run",
+                "support",
+                "foreign",
+            )
+            .unwrap();
+        let mut foreign = decision_package_input(1, None);
+        foreign["package"]["question"] = json!("FOREIGN_DECISION_CANARY");
+        crate::decision_tools::append(&journal, "other-run", "foreign-append", &foreign).unwrap();
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"tool_use","id":"foreign-read","name":"decision_audit_read","input":{"version":1,"decision_id":"decision-a","expected_revision":1}}],"stop_reason":"tool_use"}),
+            json!({"content":[{"type":"text","text":"held"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+        let replay: Value = serde_json::from_str(&requests[1]).unwrap();
+        let result = &replay["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        assert_eq!(result["tool_use_id"], "foreign-read");
+        assert_eq!(result["content"], "Error: DECISION_AUDIT_REJECTED");
+        assert!(!result.to_string().contains("FOREIGN_DECISION_CANARY"));
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "completed");
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .events[0]
+                .package
+                .question
+                .contains("FOREIGN_DECISION_CANARY"),
+            "general privileged local history remains intact"
+        );
+        let rejected = journal
+            .steps(&request.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|step| step.tool_use_id.as_deref() == Some("foreign-read"))
+            .unwrap();
+        assert_eq!(rejected.status, "failed");
+        assert_eq!(rejected.result.unwrap()["error"], "DECISION_AUDIT_REJECTED");
+    }
+
+    #[test]
     fn configured_private_name_is_rejected_before_run_creation() {
         let app = TempApp::new("decision-name-collision");
         let error = run(app.path(), "support", json!({"name":"support","provider":"anthropic","model":"x","tools":[{"kind":"rust","name":"decision_audit_append"}]}), None, BeatboxConfig::default(), "x").unwrap_err();
