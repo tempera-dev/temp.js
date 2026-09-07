@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 mod read_projection;
+mod storage;
 pub use read_projection::{
     GoalActivityCursor, GoalActivityPage, GoalActivityReceipt, GoalSummary, PreparationCounts,
 };
@@ -428,9 +429,7 @@ fn now() -> i64 {
 
 impl Journal {
     pub fn open(app_dir: &Path) -> Result<Self> {
-        let dir = app_dir.join(".beater");
-        std::fs::create_dir_all(&dir)?;
-        let mut conn = Connection::open(dir.join("journal.db"))?;
+        let mut conn = storage::open_connection(app_dir)?;
         conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let journal_mode: String =
@@ -2560,6 +2559,18 @@ mod tests {
         let conn = Connection::open(beater.join("journal.db")).unwrap();
         conn.execute_batch("CREATE TABLE runs(id TEXT PRIMARY KEY, agent TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); INSERT INTO runs VALUES('legacy','support','running','inspect',1,1);").unwrap();
         drop(conn);
+        // A legacy database must complete the explicit offline permissions
+        // migration before schema migration. Its contents remain unchanged.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let database = beater.join("journal.db");
+            let before = std::fs::read(&database).unwrap();
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(super::Journal::open(app.path()).is_err());
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let journal = super::Journal::open(app.path()).unwrap();
         let binding: Option<String> = journal
             .conn

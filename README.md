@@ -66,6 +66,21 @@ Route-bound actions publish one canonical model-facing argument contract: `input
 
 ## Current limits
 
+Journal storage requires an existing, explicitly selected application directory
+on Unix (Linux/macOS). The runtime creates `.beater` with mode `0700` and a new
+`journal.db` with mode `0600`. Journal files and SQLite sidecars must be regular,
+single-link, owner-only files belonging to the journal directory's owner;
+symlinks and permissive legacy files are rejected before SQLite opens them.
+For a legacy permissions error, stop **all** runtimes using that application,
+verify the exact `.beater` directory and `journal.db`, `journal.db-wal`,
+`journal.db-shm`, and `journal.db-journal` files are owned, non-symlink,
+single-link files, and set only the existing journal files to mode `0600`
+before restarting. Do not recursively chmod an application or follow links.
+This filesystem boundary assumes a trusted local application root: it is not
+a sandbox against another same-UID process concurrently replacing ancestors.
+Windows/reparse-point and ACL qualification is not implemented; journal open
+fails closed on unsupported platforms.
+
 `beater dev` defaults to one JS route isolate, so TS routes and React SSR serialize unless you set `[app].workers = N` in `beater.toml`. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and scaling gate.
 
 Server-side routes can import local ESM packages from `node_modules` with bare package specifiers. The resolver handles exact and wildcard package `exports` entries, array export targets, `node`, `import`, `module`, and `default` conditions, plus `module`/`main` fallbacks. Leaf `.cjs` modules are wrapped as ESM default exports of `module.exports`, so simple CommonJS packages can be imported with `import pkg from "pkg"`. Apps can also add an `import_map.json` beside `beater.toml` with local `imports` aliases such as `"#lib": "./app/lib/index.ts"` or prefix aliases such as `"#features/": "./app/features/"`; targets are resolved inside the app root. The current server-side Node built-in shim set covers minimal `node:assert`/`assert`, `node:buffer`/`buffer`, minimal `node:events`/`events` EventEmitter semantics, minimal `node:module`/`module` discovery for Beater-supported shims only plus fail-closed `createRequire`, sanitized deterministic `node:os`/`os`, string-only POSIX `node:path`/`path`, sanitized `node:querystring`/`querystring` parsing and stringifying, bounded in-memory `node:stream`/`stream` and `node:stream/promises` helpers, isolate-local `node:timers`/`timers` and `node:timers/promises` helpers with no-op `ref`/`unref` handle compatibility, deterministic file URL helpers from `node:url`/`url`, sanitized `node:process`/`process`, and deterministic `node:util`/`util` plus `node:util/types` helpers for common npm diagnostics/inheritance/callback interop; CommonJS `require` fails closed, and broader Node built-ins remain outside this wedge.
