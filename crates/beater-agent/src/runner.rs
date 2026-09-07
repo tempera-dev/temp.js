@@ -2577,6 +2577,62 @@ def run(input):
     }
 
     #[test]
+    fn resume_parks_duplicate_completed_tool_use_ids_without_reissue_or_replay() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("duplicate-completed-tool-id");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "resume safely")
+            .unwrap();
+        let llm = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"messages": [{"role":"user","content":"resume safely"}]}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        journal.complete_step("run-1", llm, &json!({"content":[{"type":"tool_use","id":"duplicated","name":"echo","input":{"value":"x"}}],"stop_reason":"tool_use"})).unwrap();
+        for attempt in [1, 2] {
+            let step = journal
+                .start_step(
+                    "run-1",
+                    "tool_call",
+                    &json!({"name":"echo","tool_use_id":"duplicated","input":{"value":"x"}}),
+                    Some("echo"),
+                    Some("duplicated"),
+                    attempt,
+                )
+                .unwrap();
+            journal
+                .complete_step("run-1", step, &json!({"content":"historical-{attempt}"}))
+                .unwrap();
+        }
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let steps = journal.steps("run-1").unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        assert_eq!(
+            steps.len(),
+            3,
+            "no model reissue or tool replay may be recorded"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.kind == "tool_call" && step.status == "completed")
+                .count(),
+            2,
+            "retain both ambiguous historical outcomes"
+        );
+    }
+
+    #[test]
     fn resume_cleans_stale_browser_session_before_review() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("browser-stale-session");
