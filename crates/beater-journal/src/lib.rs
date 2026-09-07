@@ -9,6 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub mod decision_audit;
+pub use decision_audit::{
+    DecisionAuditEventV1, DecisionAuditProjectionV1, DecisionDomain, DecisionPackageV1,
+    ExecutionAuthority, VerificationCeiling, verify_decision_audit_event,
+};
 mod read_projection;
 pub use read_projection::{
     GoalActivityCursor, GoalActivityPage, GoalActivityReceipt, GoalSummary, PreparationCounts,
