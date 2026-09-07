@@ -2671,21 +2671,49 @@ def run(input):
             )
             .unwrap();
         journal.complete_step("run-1", llm, &json!({"content":[{"type":"tool_use","id":"duplicated","name":"echo","input":{"value":"x"}}],"stop_reason":"tool_use"})).unwrap();
-        for attempt in [1, 2] {
-            let step = journal
-                .start_step(
-                    "run-1",
-                    "tool_call",
-                    &json!({"name":"echo","tool_use_id":"duplicated","input":{"value":"x"}}),
-                    Some("echo"),
-                    Some("duplicated"),
-                    attempt,
-                )
-                .unwrap();
+        let input = json!({"value":"x"});
+        let agent: AgentConfig = serde_json::from_value(config(true)).unwrap();
+        let registry = ToolRegistry::build_with_beatbox(
+            &app.path().join("agents/support"),
+            &agent.tools,
+            &BeatboxConfig::default(),
+        )
+        .unwrap();
+        let contract = registry.resume_contract("echo").unwrap();
+        for (attempt, content) in [(1, "historical-one"), (2, "historical-two")] {
+            let call = super::start_journaled_tool_call_with_contract(
+                &journal,
+                "run-1",
+                "echo",
+                "duplicated",
+                &input,
+                attempt,
+                super::tool_idempotency_key("run-1", "duplicated"),
+                Some(contract.clone()),
+            )
+            .unwrap();
             journal
-                .complete_step("run-1", step, &json!({"content":"historical-{attempt}"}))
+                .complete_step("run-1", call.seq, &json!({"content":content}))
                 .unwrap();
         }
+        let completed: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.kind == "tool_call")
+            .collect();
+        assert!(
+            completed
+                .iter()
+                .all(|step| super::completed_tool_matches_recorded_contract(
+                    "run-1",
+                    "echo",
+                    "duplicated",
+                    &input,
+                    step,
+                    Some(&contract)
+                ))
+        );
         let _env = EnvGuard::set("http://127.0.0.1:9");
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
             Ok(config(true))
@@ -2705,6 +2733,40 @@ def run(input):
                 .count(),
             2,
             "retain both ambiguous historical outcomes"
+        );
+    }
+
+    #[test]
+    fn resume_replays_one_valid_completed_tool_result_then_reaches_end_turn() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("one-completed-tool-id");
+        seed_interrupted_tool_run(&app);
+        let journal = Journal::open(app.path()).unwrap();
+        let step = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .find(|step| step.kind == "tool_call")
+            .unwrap();
+        journal
+            .complete_step("run-1", step.seq, &json!({"content":"cached-result"}))
+            .unwrap();
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("cached-result"));
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        assert_eq!(
+            journal.steps("run-1").unwrap().len(),
+            3,
+            "cached result must not replay the tool effect"
         );
     }
 
