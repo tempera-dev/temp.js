@@ -2,22 +2,22 @@
 //! reloads and every LLM/tool step is journaled before it executes.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::journal::Journal;
 use crate::llm::{LlmClient, LlmSelection};
+use crate::ownership::RunOwnership;
 use crate::registry::{
     AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
     browser_session_dir, cleanup_stale_browser_sessions,
 };
+use crate::resume_contract::ToolResumeContract;
 use crate::trace_export;
+use beater_journal::{GoalRunGate, GoalRunNeedsReview, GoalScope, Journal};
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
-const LIVE_RUN_RESUME_GRACE: Duration = Duration::from_secs(30);
 
 struct Ctx {
     journal: Journal,
@@ -31,6 +31,17 @@ struct Ctx {
 pub struct JournaledToolCall {
     pub seq: i64,
     pub context: ToolCallContext,
+}
+
+/// Trusted-local linkage, not authenticated scope or effect authority. Keep the
+/// caller-chosen run ID to resume the same durable work after a setup failure.
+pub struct GoalRunRequest {
+    pub run_id: String,
+    pub scope: GoalScope,
+    pub goal_id: String,
+    pub expected_revision: i64,
+    pub agent_name: String,
+    pub prompt: String,
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -72,6 +83,8 @@ pub fn run(
     beatbox: BeatboxConfig,
     prompt: &str,
 ) -> Result<()> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let _ownership = RunOwnership::acquire(app_dir, &run_id)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     anyhow::ensure!(
         config.name == agent_name,
@@ -81,7 +94,6 @@ pub fn run(
     let llm = LlmSelection::from_config(&config)?;
     let client = LlmClient::from_provider(&llm.provider)?;
     let journal = Journal::open(app_dir)?;
-    let run_id = uuid::Uuid::new_v4().to_string();
     journal.create_run(&run_id, agent_name, prompt)?;
     println!("run {run_id}");
 
@@ -94,9 +106,42 @@ pub fn run(
         run_id,
     };
     let messages = vec![json!({"role": "user", "content": prompt})];
-    let result = runtime()?.block_on(agent_loop(&ctx, messages, 1));
+    let result = runtime()?.block_on(async {
+        let result = agent_loop(&ctx, messages, 1).await;
+        finish_goal_review(&ctx, result).await
+    });
     export_run_trace_best_effort(app_dir, &ctx.run_id);
     result
+}
+
+/// Atomically persist a goal-bound run, then use the existing worker under the
+/// same ownership lock. A duplicate run ID is an error; use `resume` thereafter.
+pub fn run_for_goal(
+    app_dir: &Path,
+    request: &GoalRunRequest,
+    venv: Option<PathBuf>,
+    beatbox: BeatboxConfig,
+    load_config: impl Fn(&str) -> Result<Value>,
+) -> Result<()> {
+    let _ownership = RunOwnership::acquire(app_dir, &request.run_id)?;
+    let journal = Journal::open(app_dir)?;
+    journal.create_goal_bound_run(
+        &request.scope,
+        &request.goal_id,
+        request.expected_revision,
+        &request.run_id,
+        &request.agent_name,
+        &request.prompt,
+    )?;
+    println!("run {}", request.run_id);
+    resume_owned(
+        app_dir,
+        &request.run_id,
+        journal,
+        venv,
+        beatbox,
+        load_config,
+    )
 }
 
 pub fn resume(
@@ -106,21 +151,35 @@ pub fn resume(
     beatbox: BeatboxConfig,
     load_config: impl Fn(&str) -> Result<Value>,
 ) -> Result<()> {
+    let _ownership = RunOwnership::acquire(app_dir, run_id)?;
     let journal = Journal::open(app_dir)?;
+    resume_owned(app_dir, run_id, journal, venv, beatbox, load_config)
+}
+
+fn resume_owned(
+    app_dir: &Path,
+    run_id: &str,
+    journal: Journal,
+    venv: Option<PathBuf>,
+    beatbox: BeatboxConfig,
+    load_config: impl Fn(&str) -> Result<Value>,
+) -> Result<()> {
     let run = journal.run(run_id)?;
+    if matches!(journal.gate_goal_run(run_id)?, GoalRunGate::NeedsReview) {
+        println!("run {run_id} needs review: its goal binding is no longer current");
+        return Ok(());
+    }
     if run.status == "completed" {
         println!("run {run_id} already completed");
         return Ok(());
     }
-    if run.status == "running" && run.updated_at + LIVE_RUN_RESUME_GRACE.as_secs() as i64 > now() {
-        bail!(
-            "run {run_id} still appears active; wait at least {}s after its last journal update before resuming",
-            LIVE_RUN_RESUME_GRACE.as_secs()
-        );
-    }
     cleanup_stale_browser_sessions(app_dir, run_id)
         .with_context(|| format!("cleaning stale browser sessions for run {run_id}"))?;
     let config_value = load_config(&run.agent)?;
+    anyhow::ensure!(
+        config_value["name"].as_str() == Some(run.agent.as_str()),
+        "resumed agent configuration does not match the saved agent"
+    );
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
     let llm = LlmSelection::from_config(&config)?;
@@ -133,13 +192,31 @@ pub fn resume(
         model: llm.model,
         run_id: run_id.to_string(),
     };
-    let result = runtime()?.block_on(resume_async(&ctx, run, steps));
+    let result = runtime()?.block_on(async {
+        let result = resume_async(&ctx, run, steps).await;
+        finish_goal_review(&ctx, result).await
+    });
     export_run_trace_best_effort(app_dir, &ctx.run_id);
     result
 }
 
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+async fn finish_goal_review(ctx: &Ctx, result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.downcast_ref::<GoalRunNeedsReview>().is_some() => {
+            println!(
+                "run {} needs review: its goal binding is no longer current",
+                ctx.run_id
+            );
+            close_browser_sessions_best_effort(ctx).await;
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn is_review_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ToolNeedsReview>().is_some()
+        || error.downcast_ref::<GoalRunNeedsReview>().is_some()
 }
 
 fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
@@ -150,8 +227,8 @@ fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
 
 async fn resume_async(
     ctx: &Ctx,
-    run: crate::journal::RunRow,
-    steps: Vec<crate::journal::StepRow>,
+    run: beater_journal::RunRow,
+    steps: Vec<beater_journal::StepRow>,
 ) -> Result<()> {
     let run_id = ctx.run_id.as_str();
     // Rebuild conversation state from the journal. The last llm_call's request
@@ -226,7 +303,8 @@ async fn resume_async(
                 }
 
                 // Fill in tool results: journaled ones verbatim; dangling ones
-                // re-run ONLY if the tool is declared idempotent (§5 rule 4).
+                // Replay requires the original declaration and current descriptor
+                // to agree. Mutable current configuration cannot bless old work.
                 let mut tool_results = Vec::new();
                 for tu in &tool_uses {
                     let (id, name) = (
@@ -249,13 +327,18 @@ async fn resume_async(
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
                         }
                         None => {
-                            if let Some(tool) = ctx.registry.get(name)
-                                && !tool.idempotent
-                            {
+                            if !tool_replay_matches_recorded_contract(
+                                run_id,
+                                name,
+                                id,
+                                &tu["input"],
+                                &steps,
+                                ctx.registry.resume_contract(name).as_ref(),
+                            ) {
                                 ctx.journal.set_run_status(run_id, "needs_review")?;
                                 println!(
                                     "run {run_id} needs review: tool {name} ({id}) may have executed \
-                                     before the crash and is not declared idempotent — not re-running"
+                                     before the crash and lacks an unchanged, originally idempotent replay contract"
                                 );
                                 close_browser_sessions_best_effort(ctx).await;
                                 return Ok(());
@@ -276,7 +359,7 @@ async fn resume_async(
                                 Ok(content) => {
                                     json!({"type": "tool_result", "tool_use_id": id, "content": content})
                                 }
-                                Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
+                                Err(e) if is_review_error(&e) => {
                                     println!("← needs review: {e:#}");
                                     ctx.journal.set_run_status(run_id, "needs_review")?;
                                     close_browser_sessions_best_effort(ctx).await;
@@ -390,7 +473,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                                 "type": "tool_result", "tool_use_id": id, "content": content,
                             }));
                         }
-                        Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
+                        Err(e) if is_review_error(&e) => {
                             println!("← needs review: {e:#}");
                             ctx.journal.set_run_status(&ctx.run_id, "needs_review")?;
                             close_browser_sessions_best_effort(ctx).await;
@@ -455,7 +538,30 @@ pub fn start_journaled_tool_call(
     attempt: i64,
     idempotency_key: Option<String>,
 ) -> Result<JournaledToolCall> {
-    let request = match &idempotency_key {
+    start_journaled_tool_call_with_contract(
+        journal,
+        run_id,
+        name,
+        tool_use_id,
+        input,
+        attempt,
+        idempotency_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_journaled_tool_call_with_contract(
+    journal: &Journal,
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    attempt: i64,
+    idempotency_key: Option<String>,
+    contract: Option<ToolResumeContract>,
+) -> Result<JournaledToolCall> {
+    let mut request = match &idempotency_key {
         Some(key) => json!({
             "name": name,
             "input": input,
@@ -464,6 +570,10 @@ pub fn start_journaled_tool_call(
         }),
         None => json!({"name": name, "input": input, "tool_use_id": tool_use_id}),
     };
+    if let Some(contract) = contract {
+        anyhow::ensure!(contract.is_valid(), "invalid tool resume contract");
+        request["resume_contract"] = serde_json::to_value(contract)?;
+    }
     let seq = journal.start_step(
         run_id,
         "tool_call",
@@ -508,7 +618,7 @@ async fn execute_tool_step(
     attempt: i64,
 ) -> Result<String> {
     let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
-    let call = start_journaled_tool_call(
+    let call = start_journaled_tool_call_with_contract(
         &ctx.journal,
         &ctx.run_id,
         name,
@@ -516,6 +626,7 @@ async fn execute_tool_step(
         input,
         attempt,
         idempotency_key,
+        ctx.registry.resume_contract(name),
     )?;
     match ctx
         .registry
@@ -537,11 +648,55 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
     (!tool_use_id.is_empty()).then(|| format!("beater:{run_id}:tool:{tool_use_id}"))
 }
 
+fn tool_replay_matches_recorded_contract(
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    steps: &[beater_journal::StepRow],
+    current: Option<&ToolResumeContract>,
+) -> bool {
+    let Some(current) =
+        current.filter(|value| value.is_valid() && value.idempotent && value.name == name)
+    else {
+        return false;
+    };
+    let Some(key) = tool_idempotency_key(run_id, tool_use_id) else {
+        return false;
+    };
+    let mut found = false;
+    for step in steps
+        .iter()
+        .filter(|step| step.kind == "tool_call" && step.tool_use_id.as_deref() == Some(tool_use_id))
+    {
+        found = true;
+        if step.tool_name.as_deref() != Some(name)
+            || step.request["name"].as_str() != Some(name)
+            || step.request["tool_use_id"].as_str() != Some(tool_use_id)
+            || step.request["input"] != *input
+            || step.request["idempotency_key"].as_str() != Some(key.as_str())
+            || step.attempt <= 0
+            || step.attempt == i64::MAX
+        {
+            return false;
+        }
+        let Ok(recorded) =
+            serde_json::from_value::<ToolResumeContract>(step.request["resume_contract"].clone())
+        else {
+            return false;
+        };
+        if !recorded.is_valid() || !recorded.idempotent || recorded != *current {
+            return false;
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_RUN_RESUME_GRACE, resume, run, tool_idempotency_key};
-    use crate::journal::Journal;
-    use crate::registry::BeatboxConfig;
+    use super::{resume, run, tool_idempotency_key};
+    use crate::registry::{AgentConfig, BeatboxConfig, ToolRegistry};
+    use beater_journal::Journal;
     use rusqlite::params;
     use serde_json::{Value, json};
     use std::collections::VecDeque;
@@ -718,6 +873,13 @@ def run(input):
 
     impl MockAnthropic {
         fn new(responses: Vec<Value>) -> Self {
+            Self::before_response(responses, || {})
+        }
+
+        fn before_response(
+            responses: Vec<Value>,
+            mut before_response: impl FnMut() + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -731,6 +893,7 @@ def run(input):
                     let (mut stream, _) = listener.accept().unwrap();
                     let body = read_http_body(&mut stream);
                     server_requests.lock().unwrap().push(body);
+                    before_response();
                     let reply = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
                         response
@@ -1034,11 +1197,67 @@ def run(input):
         })
     }
 
+    fn remote_config(endpoint: &str, schema: Value) -> Value {
+        let url = reqwest::Url::parse(endpoint).unwrap();
+        let host = url.host_str().unwrap();
+        let egress = url
+            .port()
+            .map(|port| format!("{host}:{port}"))
+            .unwrap_or_else(|| host.to_string());
+        json!({
+            "name": "support",
+            "provider": "anthropic",
+            "model": "mock",
+            "system": "test",
+            "tools": [{
+                "kind": "remote_mcp",
+                "name": "crm.lookup",
+                "description": "Look up a contact.",
+                "inputSchema": schema,
+                "endpoint": endpoint,
+                "tool": "lookup",
+                "timeoutMs": 1000,
+                "egress": [egress],
+                "idempotent": true,
+            }],
+        })
+    }
+
     fn seed_interrupted_tool_run(app: &TempApp) {
-        seed_interrupted_tool_run_for(app, "echo", json!({"value": "ok"}));
+        seed_interrupted_tool_run_for_config(
+            app,
+            "echo",
+            json!({"value": "ok"}),
+            config(true),
+            BeatboxConfig::default(),
+        );
     }
 
     fn seed_interrupted_tool_run_for(app: &TempApp, name: &str, input: Value) {
+        seed_interrupted_tool_run_for_config(
+            app,
+            name,
+            input,
+            config(true),
+            BeatboxConfig::default(),
+        );
+    }
+
+    fn seed_interrupted_tool_run_for_config(
+        app: &TempApp,
+        name: &str,
+        input: Value,
+        config_value: Value,
+        beatbox: BeatboxConfig,
+    ) {
+        let config: AgentConfig = serde_json::from_value(config_value).unwrap();
+        let registry = ToolRegistry::build_with_beatbox(
+            &app.path().join("agents").join(&config.name),
+            &config.tools,
+            &beatbox,
+        )
+        .unwrap();
+        let contract = registry.resume_contract(name);
         let journal = Journal::open(app.path()).unwrap();
         journal
             .create_run("run-1", "support", &format!("call {name}"))
@@ -1059,16 +1278,17 @@ def run(input):
             .start_step("run-1", "llm_call", &request, None, None, 1)
             .unwrap();
         journal.complete_step("run-1", llm, &response).unwrap();
-        journal
-            .start_step(
-                "run-1",
-                "tool_call",
-                &json!({"name": name, "input": input, "tool_use_id": "toolu_1"}),
-                Some(name),
-                Some("toolu_1"),
-                1,
-            )
-            .unwrap();
+        super::start_journaled_tool_call_with_contract(
+            &journal,
+            "run-1",
+            name,
+            "toolu_1",
+            &input,
+            1,
+            super::tool_idempotency_key("run-1", "toolu_1"),
+            contract,
+        )
+        .unwrap();
         mark_run_stale(app, "run-1");
     }
 
@@ -1123,8 +1343,7 @@ def run(input):
     }
 
     fn mark_run_stale(app: &TempApp, run_id: &str) {
-        let stale_updated_at =
-            chrono::Utc::now().timestamp() - LIVE_RUN_RESUME_GRACE.as_secs() as i64 - 1;
+        let stale_updated_at = chrono::Utc::now().timestamp() - 31;
         let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
         conn.execute(
             "UPDATE runs SET updated_at = ?2 WHERE id = ?1",
@@ -1182,6 +1401,221 @@ def run(input):
             "created_at": "2026-07-02T00:00:00Z",
             "updated_at": "2026-07-02T00:00:00Z",
         })
+    }
+
+    #[test]
+    fn goal_run_stale_creation_never_loads_configuration() {
+        let app = TempApp::new("goal-stale-create");
+        let journal = Journal::open(app.path()).unwrap();
+        let mut request = create_goal_request(&journal);
+        request.expected_revision = 2;
+        assert!(
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                panic!("stale goal must be rejected before configuration")
+            })
+            .is_err()
+        );
+        assert!(journal.run(&request.run_id).is_err());
+        assert!(journal.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_run_stale_resume_parks_before_configuration() {
+        let app = TempApp::new("goal-stale-resume");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                1,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        journal
+            .start_step(
+                &request.run_id,
+                "llm_call",
+                &json!({"messages": []}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        revise_test_goal(&journal, &request.scope);
+        resume(
+            app.path(),
+            &request.run_id,
+            None,
+            BeatboxConfig::default(),
+            |_| panic!("stale goal must be parked before configuration"),
+        )
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn goal_run_current_uses_existing_worker_and_completes() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("goal-current-run");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "local test response"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+        super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(server.join().len(), 1);
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "completed");
+        assert!(
+            matches!(journal.gate_goal_run(&request.run_id).unwrap(), beater_journal::GoalRunGate::Current(binding) if binding.goal_revision == 1 && binding.scope == request.scope)
+        );
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 1);
+        revise_test_goal(&journal, &request.scope);
+        resume(
+            app.path(),
+            &request.run_id,
+            None,
+            BeatboxConfig::default(),
+            |_| panic!("historically completed work must be checked against the corrected goal"),
+        )
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        let steps = journal.steps(&request.run_id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].status, "completed",
+            "retain historical response evidence"
+        );
+    }
+
+    #[test]
+    fn goal_run_changed_during_setup_never_starts_model_step() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("goal-setup-change");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+        super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            revise_test_goal(&journal, &request.scope);
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert!(journal.steps(&request.run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn goal_run_changed_during_model_call_cannot_dispatch_tool_or_mark_complete() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for response in [
+            json!({"content": [{"type": "text", "text": "old goal answer"}], "stop_reason": "end_turn"}),
+            json!({"content": [{"type": "tool_use", "id": "toolu_1", "name": "echo", "input": {"value": "old"}}], "stop_reason": "tool_use"}),
+        ] {
+            let app = TempApp::new("goal-inflight-change");
+            let journal = Journal::open(app.path()).unwrap();
+            let request = create_goal_request(&journal);
+            let app_path = app.path().to_path_buf();
+            let scope = request.scope.clone();
+            let server = MockAnthropic::before_response(vec![response], move || {
+                revise_test_goal(&Journal::open(&app_path).unwrap(), &scope);
+            });
+            let _env = EnvGuard::set(&server.base_url);
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert_eq!(server.join().len(), 1);
+            assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+            let steps = journal.steps(&request.run_id).unwrap();
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].kind, "llm_call");
+            assert_eq!(steps[0].status, "completed");
+            assert!(
+                steps[0].result.is_some(),
+                "retain the actual old response without claiming current completion"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_run_rejects_different_agent_before_registry_setup() {
+        let app = TempApp::new("goal-config-name");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let error =
+            super::run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(json!({"name": "other", "tools": [{"kind": "python", "path": "missing.py"}]}))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("saved agent"));
+        assert!(journal.steps(&request.run_id).unwrap().is_empty());
+    }
+
+    fn create_goal_request(journal: &Journal) -> super::GoalRunRequest {
+        use beater_journal::{Goal, GoalMutation, GoalScope, PlaybookIdentity};
+        let scope = GoalScope {
+            organization: "org".into(),
+            project: "project".into(),
+            environment: "test".into(),
+            site: "site".into(),
+        };
+        journal
+            .create_goal(
+                &GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "create".into(),
+                    operation: "create".into(),
+                },
+                Goal {
+                    id: "goal".into(),
+                    scope: scope.clone(),
+                    revision: 1,
+                    objective: "Prepare a current proposal".into(),
+                    playbook: PlaybookIdentity {
+                        id: "generic-preparation".into(),
+                        digest: "a".repeat(64),
+                    },
+                    parameters: Default::default(),
+                },
+            )
+            .unwrap();
+        super::GoalRunRequest {
+            run_id: "goal-run".into(),
+            scope,
+            goal_id: "goal".into(),
+            expected_revision: 1,
+            agent_name: "support".into(),
+            prompt: "Prepare current goal".into(),
+        }
+    }
+
+    fn revise_test_goal(journal: &Journal, scope: &beater_journal::GoalScope) {
+        use beater_journal::{GoalMutation, GoalPatch};
+        journal
+            .revise_goal(
+                &GoalMutation {
+                    actor: "owner".into(),
+                    request_id: "correct".into(),
+                    operation: "correct".into(),
+                },
+                scope,
+                "goal",
+                1,
+                GoalPatch {
+                    objective: Some("Prepare a revised proposal".into()),
+                    playbook: None,
+                    parameters: None,
+                },
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1275,50 +1709,27 @@ def run(input):
     }
 
     #[test]
-    fn resume_turns_removed_tool_rerun_into_error_result() {
+    fn resume_parks_removed_tool_without_replaying_legacy_step() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("removed-tool");
         seed_interrupted_tool_run_for(&app, "old.echo", json!({"value": "ok"}));
-        let server = MockAnthropic::new(vec![json!({
-            "content": [{"type": "text", "text": "handled missing tool"}],
-            "stop_reason": "end_turn",
-        })]);
-        let _env = EnvGuard::set(&server.base_url);
+        let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
             Ok(config(true))
         })
         .unwrap();
-        let requests = server.join();
-
-        assert_eq!(requests.len(), 1);
-        let body: Value = serde_json::from_str(&requests[0]).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        let tool_result = &messages.last().unwrap()["content"][0];
-        assert_eq!(tool_result["tool_use_id"], "toolu_1");
-        assert_eq!(tool_result["is_error"], true);
-        assert!(
-            tool_result["content"]
-                .as_str()
-                .unwrap()
-                .contains("no tool named old.echo"),
-            "{tool_result}"
-        );
-
         let journal = Journal::open(app.path()).unwrap();
-        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
         let tool_steps: Vec<_> = journal
             .steps("run-1")
             .unwrap()
             .into_iter()
             .filter(|step| step.kind == "tool_call")
             .collect();
-        assert_eq!(tool_steps.len(), 2);
+        assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].tool_name.as_deref(), Some("old.echo"));
         assert_eq!(tool_steps[0].status, "started");
-        assert_eq!(tool_steps[1].tool_name.as_deref(), Some("old.echo"));
-        assert_eq!(tool_steps[1].status, "failed");
-        assert_eq!(tool_steps[1].attempt, 2);
     }
 
     #[test]
@@ -1570,10 +1981,41 @@ def run(input):
     }
 
     #[test]
+    fn resume_does_not_promote_original_non_idempotent_declaration() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("idempotence-promotion");
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "echo",
+            json!({"value": "ok"}),
+            config(false),
+            BeatboxConfig::default(),
+        );
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        let steps = journal.steps("run-1").unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].status, "started");
+        assert_eq!(steps[1].attempt, 1);
+        assert_eq!(steps[1].request["resume_contract"]["idempotent"], false);
+    }
+
+    #[test]
     fn resume_parks_interrupted_non_idempotent_tool_for_review() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("non-idempotent");
-        seed_interrupted_tool_run(&app);
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "echo",
+            json!({"value": "ok"}),
+            config(false),
+            BeatboxConfig::default(),
+        );
         let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
@@ -1592,6 +2034,98 @@ def run(input):
         assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].status, "started");
         assert_eq!(tool_steps[0].attempt, 1);
+    }
+
+    #[test]
+    fn resume_parks_config_or_schema_drift_before_any_replay() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for (label, current) in [
+            (
+                "endpoint",
+                remote_config(
+                    "http://127.0.0.1:19002/mcp",
+                    json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+                ),
+            ),
+            (
+                "schema",
+                remote_config(
+                    "http://127.0.0.1:19001/mcp",
+                    json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+                ),
+            ),
+        ] {
+            let app = TempApp::new(label);
+            let original = remote_config(
+                "http://127.0.0.1:19001/mcp",
+                json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+            );
+            seed_interrupted_tool_run_for_config(
+                &app,
+                "crm.lookup",
+                json!({"email": "a@example.test"}),
+                original,
+                BeatboxConfig::default(),
+            );
+            let _env = EnvGuard::set("http://127.0.0.1:9");
+            resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+                Ok(current.clone())
+            })
+            .unwrap();
+            let journal = Journal::open(app.path()).unwrap();
+            assert_eq!(
+                journal.run("run-1").unwrap().status,
+                "needs_review",
+                "{label}"
+            );
+            assert_eq!(journal.steps("run-1").unwrap().len(), 2, "{label}");
+        }
+    }
+
+    #[test]
+    fn resume_parks_legacy_or_malformed_contracts() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for malformed in [false, true] {
+            let app = TempApp::new(if malformed {
+                "malformed-contract"
+            } else {
+                "legacy-contract"
+            });
+            seed_interrupted_tool_run(&app);
+            let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
+            let raw_request: String = conn
+                .query_row(
+                    "SELECT request FROM steps WHERE run_id='run-1' AND kind='tool_call'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut request: Value = serde_json::from_str(&raw_request).unwrap();
+            if malformed {
+                request["resume_contract"] =
+                    json!({"version": 1, "name": "echo", "idempotent": true, "fingerprint": "bad"});
+            } else {
+                request.as_object_mut().unwrap().remove("resume_contract");
+            }
+            conn.execute(
+                "UPDATE steps SET request=?1 WHERE run_id='run-1' AND kind='tool_call'",
+                [request.to_string()],
+            )
+            .unwrap();
+            let _env = EnvGuard::set("http://127.0.0.1:9");
+            resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert_eq!(
+                Journal::open(app.path())
+                    .unwrap()
+                    .run("run-1")
+                    .unwrap()
+                    .status,
+                "needs_review"
+            );
+        }
     }
 
     #[test]
@@ -1725,20 +2259,36 @@ def run(input):
     }
 
     #[test]
-    fn resume_refuses_recently_updated_running_run() {
-        let app = TempApp::new("fresh-running-run");
+    fn resume_refuses_owned_running_run_before_loading_config() {
+        let app = TempApp::new("owned-running-run");
+        let _owner = crate::ownership::RunOwnership::acquire(app.path(), "run-1").unwrap();
         let journal = Journal::open(app.path()).unwrap();
         journal
             .create_run("run-1", "support", "still active")
             .unwrap();
 
         let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
-            panic!("fresh running guard should reject before loading config")
+            panic!("owned run should reject before loading config")
         })
         .unwrap_err();
 
-        assert!(format!("{err:#}").contains("still appears active"));
+        assert!(format!("{err:#}").contains("run ownership unavailable"));
         assert_eq!(journal.run("run-1").unwrap().status, "running");
+    }
+
+    #[test]
+    fn resume_without_owner_does_not_wait_for_timestamp_grace() {
+        let app = TempApp::new("unowned-fresh-run");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "interrupted")
+            .unwrap();
+        let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            anyhow::bail!("config loader reached after exclusive ownership")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("config loader reached"));
+        assert!(crate::ownership::RunOwnership::acquire(app.path(), "run-1").is_ok());
     }
 
     #[test]
@@ -1826,7 +2376,6 @@ def run(input):
     fn resume_reruns_interrupted_idempotent_sandbox_tool_through_beatbox_job() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("sandbox-idempotent");
-        seed_interrupted_tool_run_for(&app, "fib_wasm", json!({"n": 10}));
         let anthropic = MockAnthropic::new(vec![json!({
             "content": [{"type": "text", "text": "done"}],
             "stop_reason": "end_turn",
@@ -1839,6 +2388,13 @@ def run(input):
             url: beatbox.base_url.clone(),
             api_key: None,
         };
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "fib_wasm",
+            json!({"n": 10}),
+            sandbox_config(true),
+            beatbox_config.clone(),
+        );
         let _env = EnvGuard::set(&anthropic.base_url);
 
         resume(app.path(), "run-1", None, beatbox_config, |_| {
@@ -1880,7 +2436,13 @@ def run(input):
     fn resume_parks_interrupted_non_idempotent_sandbox_tool_for_review() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let app = TempApp::new("sandbox-non-idempotent");
-        seed_interrupted_tool_run_for(&app, "fib_wasm", json!({"n": 10}));
+        seed_interrupted_tool_run_for_config(
+            &app,
+            "fib_wasm",
+            json!({"n": 10}),
+            sandbox_config(false),
+            BeatboxConfig::default(),
+        );
         let _env = EnvGuard::set("http://127.0.0.1:9");
 
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {

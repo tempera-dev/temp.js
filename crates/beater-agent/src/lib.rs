@@ -6,18 +6,23 @@
 
 mod anthropic;
 mod cpp_bridge;
-mod journal;
 mod llm;
+mod ownership;
 mod registry;
+mod resume_contract;
 mod runner;
 mod trace_export;
 
-pub use journal::{Journal, RunRow, StepRow};
+pub use beater_journal::{
+    Goal, GoalMutation, GoalPatch, GoalRevision, GoalRunBinding, GoalRunGate, GoalRunNeedsReview,
+    GoalScope, HistoryWindow, Journal, Milestone, MilestoneRevision, PlaybookIdentity, RunRow,
+    StepPartialRow, StepRow,
+};
 pub use registry::{
     AgentConfig, BeatboxConfig, DEFAULT_BEATBOX_URL, ToolCallContext, ToolDecl, ToolNeedsReview,
     ToolRegistry, browser_session_dir, cleanup_stale_browser_sessions,
 };
 pub use runner::{
-    JournaledToolCall, complete_journaled_tool_call, fail_journaled_tool_call, list_runs, resume,
-    run, start_journaled_tool_call,
+    GoalRunRequest, JournaledToolCall, complete_journaled_tool_call, fail_journaled_tool_call,
+    list_runs, resume, run, run_for_goal, start_journaled_tool_call,
 };

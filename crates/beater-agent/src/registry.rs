@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -27,11 +28,14 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
+use crate::resume_contract::{ToolResumeContract, json_sha256, sha256_hex};
+
 pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
 const DEFAULT_PYTHON_TIMEOUT_MS: u64 = 10_000;
 const PLAYWRIGHT_NODE_ENV: &str = "BEATER_PLAYWRIGHT_NODE";
 const PLAYWRIGHT_RUNNER_ENV: &str = "BEATER_PLAYWRIGHT_RUNNER";
 const BROWSER_SESSION_DIR: &str = "browser-sessions";
+const MAX_RESUME_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct BeatboxConfig {
@@ -197,6 +201,7 @@ pub struct ToolEntry {
     pub description: String,
     pub input_schema: Value,
     pub idempotent: bool,
+    resume_contract: Option<ToolResumeContract>,
     pub imp: ToolImpl,
 }
 
@@ -508,7 +513,7 @@ impl ToolRegistry {
                 }
                 continue;
             }
-            let entry = match decl.kind.as_str() {
+            let mut entry = match decl.kind.as_str() {
                 "python" => {
                     let timeout = python_timeout(decl)?;
                     let rel = decl
@@ -524,6 +529,7 @@ impl ToolRegistry {
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
+                        resume_contract: None,
                         imp: ToolImpl::Python {
                             agent_dir,
                             path,
@@ -550,6 +556,7 @@ impl ToolRegistry {
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
+                        resume_contract: None,
                         imp: ToolImpl::RemoteMcp { config },
                     }
                 }
@@ -566,6 +573,7 @@ impl ToolRegistry {
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
+                        resume_contract: None,
                         imp: ToolImpl::Browser { config },
                     }
                 }
@@ -593,6 +601,7 @@ impl ToolRegistry {
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
+                        resume_contract: None,
                         imp: ToolImpl::Sandbox(Box::new(SandboxTool {
                             beatbox: beatbox.clone(),
                             lane,
@@ -632,6 +641,7 @@ impl ToolRegistry {
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
+                        resume_contract: None,
                         imp: ToolImpl::Wasmtime(Box::new(WasmtimeTool {
                             engine,
                             module,
@@ -642,6 +652,7 @@ impl ToolRegistry {
                 }
                 other => bail!("unknown tool kind {other:?} for tool {}", decl.name),
             };
+            entry.resume_contract = tool_resume_contract(agent_dir, decl, &entry, None);
             push_unique_tool(&mut tools, entry);
         }
         Ok(Self { tools })
@@ -671,6 +682,12 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&ToolEntry> {
         self.tools.iter().find(|t| t.name == name)
+    }
+
+    /// Declaration/config identity for journaled replay. It detects local drift,
+    /// not provider identity or proof that a tool is actually idempotent.
+    pub(crate) fn resume_contract(&self, name: &str) -> Option<ToolResumeContract> {
+        self.get(name)?.resume_contract.clone()
     }
 
     pub async fn close_browser_sessions(&self, run_id: &str) -> Result<()> {
@@ -764,6 +781,204 @@ fn push_unique_tool(tools: &mut Vec<ToolEntry>, tool: ToolEntry) {
     } else {
         tools.push(tool);
     }
+}
+
+fn tool_resume_contract(
+    agent_dir: &Path,
+    decl: &ToolDecl,
+    entry: &ToolEntry,
+    provider_declaration: Option<Value>,
+) -> Option<ToolResumeContract> {
+    let common = json!({
+        "kind": &decl.kind,
+        "name": &entry.name,
+        "idempotent": entry.idempotent,
+        "input_schema": &entry.input_schema,
+    });
+    let mut descriptor = common.as_object()?.clone();
+    match &entry.imp {
+        ToolImpl::Python { path, timeout, .. } => {
+            descriptor.insert("path".into(), json!(path));
+            descriptor.insert(
+                "source_sha256".into(),
+                json!(sha256_hex(&bounded_regular_file_bytes(path)?)),
+            );
+            descriptor.insert("timeout_ms".into(), json!(timeout.as_millis()));
+        }
+        ToolImpl::RustBuiltin => {}
+        ToolImpl::RemoteMcp { config } => {
+            descriptor.insert("endpoint".into(), json!(config.endpoint.as_str()));
+            descriptor.insert("remote_tool".into(), json!(&config.remote_tool));
+            descriptor.insert("timeout_ms".into(), json!(config.timeout.as_millis()));
+            descriptor.insert("retry".into(), json!({
+                "attempts": config.retry.attempts,
+                "backoff_ms": config.retry.backoff.as_millis(),
+                "idempotency_key": matches!(config.retry.idempotency_key, Some(IdempotencyKeySource::ToolUseId)).then_some("tool_use_id"),
+            }));
+            descriptor.insert("egress".into(), json!(&decl.egress));
+            descriptor.insert("auth".into(), remote_auth_descriptor(&config.auth));
+            descriptor.insert(
+                "session".into(),
+                remote_session_descriptor(config.session.as_ref()),
+            );
+            if let Some(provider_declaration) = provider_declaration {
+                descriptor.insert("provider_declaration".into(), provider_declaration);
+            }
+        }
+        ToolImpl::Browser { config } => {
+            let mut secrets = config
+                .secrets
+                .sources
+                .iter()
+                .map(|(name, source)| (name.clone(), source.env.clone()))
+                .collect::<Vec<_>>();
+            secrets.sort_unstable();
+            descriptor.insert(
+                "provider".into(),
+                json!(browser_provider_name(&config.provider)),
+            );
+            descriptor.insert("timeout_ms".into(), json!(config.timeout.as_millis()));
+            descriptor.insert(
+                "session".into(),
+                json!({
+                    "scope": config.session.scope.as_str(),
+                    "cleanup": config.session.cleanup.as_str(),
+                }),
+            );
+            descriptor.insert("allowed_origins".into(), json!(&config.allowed_origins));
+            // Only selector and environment names are bound; runtime secret values
+            // are never read, retained, or hashed for a resume contract.
+            descriptor.insert("secret_selectors".into(), json!(secrets));
+        }
+        ToolImpl::Sandbox(tool) => {
+            descriptor.insert("lane".into(), json!(format!("{:?}", tool.lane)));
+            descriptor.insert("beatbox_url".into(), json!(&tool.beatbox.url));
+            descriptor.insert(
+                "source_sha256".into(),
+                json!(sandbox_source_digest(agent_dir, decl)?),
+            );
+            descriptor.insert(
+                "policy_sha256".into(),
+                json!(json_value_digest(decl.policy.as_ref())?),
+            );
+            descriptor.insert("entrypoint".into(), json!(tool.entrypoint));
+        }
+        ToolImpl::Wasmtime(tool) => {
+            descriptor.insert(
+                "source_sha256".into(),
+                json!(wasmtime_source_digest(agent_dir, decl)?),
+            );
+            descriptor.insert(
+                "policy_sha256".into(),
+                json!(json_value_digest(decl.policy.as_ref())?),
+            );
+            descriptor.insert("entrypoint".into(), json!(tool.entrypoint));
+        }
+    }
+    ToolResumeContract::new(&entry.name, entry.idempotent, &Value::Object(descriptor))
+}
+
+fn remote_auth_descriptor(auth: &RemoteMcpAuth) -> Value {
+    match auth {
+        RemoteMcpAuth::None => json!({"type": "none"}),
+        RemoteMcpAuth::BearerEnv(env) => json!({"type": "bearer_env", "env": env}),
+    }
+}
+
+fn remote_session_descriptor(session: Option<&RemoteMcpSessionPolicy>) -> Value {
+    session.map_or(
+        Value::Null,
+        |session| json!({"scope": session.scope.as_str(), "cleanup": session.cleanup.as_str()}),
+    )
+}
+
+fn browser_provider_name(provider: &BrowserProvider) -> &'static str {
+    match provider {
+        BrowserProvider::MockCdp => "mock_cdp",
+        BrowserProvider::Playwright => "playwright",
+    }
+}
+
+fn json_value_digest(value: Option<&Value>) -> Option<String> {
+    json_sha256(value.unwrap_or(&Value::Null))
+}
+
+fn sandbox_source_digest(agent_dir: &Path, decl: &ToolDecl) -> Option<String> {
+    Some(sha256_hex(&bounded_resume_source_bytes(agent_dir, decl)?))
+}
+
+fn wasmtime_source_digest(agent_dir: &Path, decl: &ToolDecl) -> Option<String> {
+    Some(sha256_hex(&bounded_resume_source_bytes(agent_dir, decl)?))
+}
+
+fn bounded_resume_source_bytes(agent_dir: &Path, decl: &ToolDecl) -> Option<Vec<u8>> {
+    match decl.source.as_ref() {
+        Some(SandboxSourceDecl::Path { path }) => bounded_regular_file_bytes(
+            &contained_agent_path(agent_dir, path, "resume source")
+                .ok()?
+                .1,
+        ),
+        Some(SandboxSourceDecl::Wat { text }) | Some(SandboxSourceDecl::WasmWat { text }) => {
+            bounded_inline_source(text.as_bytes())
+        }
+        Some(SandboxSourceDecl::WasmBase64 { bytes })
+        | Some(SandboxSourceDecl::WasmBytesBase64 { bytes }) => bounded_resume_base64(bytes),
+        Some(SandboxSourceDecl::Inline { code }) => bounded_inline_source(code.as_bytes()),
+        Some(SandboxSourceDecl::ModuleRef { .. }) => None,
+        None => bounded_regular_file_bytes(
+            &contained_agent_path(agent_dir, decl.path.as_deref()?, "resume source")
+                .ok()?
+                .1,
+        ),
+    }
+}
+
+fn bounded_resume_base64(encoded: &str) -> Option<Vec<u8>> {
+    if encoded.len() as u64 > MAX_RESUME_SOURCE_BYTES.div_ceil(3) * 4
+        || !encoded.len().is_multiple_of(4)
+    {
+        return None;
+    }
+    let padding = encoded
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    if padding > 2 {
+        return None;
+    }
+    let decoded_len = (encoded.len() / 4).checked_mul(3)?.checked_sub(padding)?;
+    if decoded_len as u64 > MAX_RESUME_SOURCE_BYTES {
+        return None;
+    }
+    // decode() allocates its rounded upper estimate, which can exceed the limit
+    // for correctly padded input. Decode into the exact bounded output instead.
+    let mut decoded = vec![0; decoded_len];
+    let written = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded, &mut decoded)
+        .ok()?;
+    (written == decoded_len).then_some(decoded)
+}
+
+fn bounded_inline_source(bytes: &[u8]) -> Option<Vec<u8>> {
+    (bytes.len() as u64 <= MAX_RESUME_SOURCE_BYTES).then(|| bytes.to_vec())
+}
+
+fn bounded_regular_file_bytes(path: &Path) -> Option<Vec<u8>> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_RESUME_SOURCE_BYTES {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.file_type().is_file() || opened.len() > MAX_RESUME_SOURCE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_RESUME_SOURCE_BYTES.checked_add(1)?)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_RESUME_SOURCE_BYTES).then_some(bytes)
 }
 
 fn python_timeout(decl: &ToolDecl) -> Result<Duration> {
@@ -2484,15 +2699,55 @@ fn remote_mcp_provider_entries(decl: &ToolDecl) -> Result<Vec<ToolEntry>> {
             entrypoint: None,
         };
         let config = RemoteMcpTool::from_decl(&remote_decl)?;
-        entries.push(ToolEntry {
+        let mut entry = ToolEntry {
             name: local_name,
             description,
             input_schema,
             idempotent: decl.idempotent,
+            resume_contract: None,
             imp: ToolImpl::RemoteMcp { config },
-        });
+        };
+        entry.resume_contract = tool_resume_contract(
+            Path::new("."),
+            &remote_decl,
+            &entry,
+            remote_mcp_provider_resume_declaration(decl),
+        );
+        entries.push(entry);
     }
     Ok(entries)
+}
+
+fn remote_mcp_provider_resume_declaration(decl: &ToolDecl) -> Option<Value> {
+    let endpoint = parse_remote_endpoint(decl.endpoint.as_deref()?).ok()?;
+    let auth = match decl.auth.as_ref() {
+        None => json!({"type": "none"}),
+        Some(auth) if auth.kind == "none" => json!({"type": "none"}),
+        Some(auth) if auth.kind == "bearer" => json!({
+            "type": "bearer_env",
+            "env": auth.env.as_deref()?.trim(),
+        }),
+        Some(_) => return None,
+    };
+    let retry = RemoteMcpRetry::from_decl(decl).ok()?;
+    Some(json!({
+        "kind": "remote_mcp_provider",
+        "name": decl.name.trim(),
+        "endpoint": endpoint.as_str(),
+        "timeout_ms": decl.timeout_ms.unwrap_or(10_000),
+        "retry": {
+            "attempts": retry.attempts,
+            "backoff_ms": retry.backoff.as_millis(),
+            "idempotency_key": matches!(retry.idempotency_key, Some(IdempotencyKeySource::ToolUseId)).then_some("tool_use_id"),
+        },
+        "egress": &decl.egress,
+        "auth": auth,
+        "session": decl.session.as_ref().map(|session| json!({
+            "scope": session.scope.as_deref().unwrap_or("run"),
+            "cleanup": session.cleanup.as_deref().unwrap_or("always"),
+        })),
+        "idempotent": decl.idempotent,
+    }))
 }
 
 fn remote_mcp_provider_discover_blocking(
@@ -2839,6 +3094,7 @@ fn rust_builtin(name: &str) -> Option<ToolEntry> {
             description: "Get the current date and time (UTC).".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
             idempotent: true, // no side effects; safe to re-run on resume
+            resume_contract: None,
             imp: ToolImpl::RustBuiltin,
         }),
         "cpp_double" => Some(ToolEntry {
@@ -2851,6 +3107,7 @@ fn rust_builtin(name: &str) -> Option<ToolEntry> {
                 "additionalProperties": false,
             }),
             idempotent: true,
+            resume_contract: None,
             imp: ToolImpl::RustBuiltin,
         }),
         _ => None,
@@ -2888,8 +3145,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BrowserSecrets, BrowserSessionGuard, BrowserSessionStore, ToolCallContext, ToolDecl,
-        ToolImpl, ToolNeedsReview, ToolRegistry, browser_action_from_input,
+        BrowserSecrets, BrowserSessionGuard, BrowserSessionStore, MAX_RESUME_SOURCE_BYTES,
+        ToolCallContext, ToolDecl, ToolImpl, ToolNeedsReview, ToolRegistry,
+        bounded_regular_file_bytes, browser_action_from_input,
         browser_action_from_input_with_secrets, browser_session_active_for_tests,
         browser_session_count_for_tests,
     };
@@ -2950,6 +3208,148 @@ mod tests {
                 .expect("rust builtin registry should build");
 
         assert!(!registry.get("get_time").unwrap().idempotent);
+    }
+
+    #[test]
+    fn resume_contract_binds_remote_endpoint_idempotence_and_schema() {
+        let agent_dir = PathBuf::new();
+        let first = ToolRegistry::build(
+            &agent_dir,
+            &[remote_decl(
+                "https://one.example/mcp",
+                Some("CRM_TOKEN"),
+                None,
+                false,
+            )],
+        )
+        .unwrap()
+        .resume_contract("crm.lookup")
+        .unwrap();
+        let endpoint_changed = ToolRegistry::build(
+            &agent_dir,
+            &[remote_decl(
+                "https://two.example/mcp",
+                Some("CRM_TOKEN"),
+                None,
+                false,
+            )],
+        )
+        .unwrap()
+        .resume_contract("crm.lookup")
+        .unwrap();
+        let idempotence_changed = ToolRegistry::build(
+            &agent_dir,
+            &[remote_decl(
+                "https://one.example/mcp",
+                Some("CRM_TOKEN"),
+                None,
+                true,
+            )],
+        )
+        .unwrap()
+        .resume_contract("crm.lookup")
+        .unwrap();
+        let mut schema_changed =
+            remote_decl("https://one.example/mcp", Some("CRM_TOKEN"), None, false);
+        schema_changed.input_schema =
+            Some(json!({"type": "object", "properties": {"id": {"type": "string"}}}));
+        let schema_changed = ToolRegistry::build(&agent_dir, &[schema_changed])
+            .unwrap()
+            .resume_contract("crm.lookup")
+            .unwrap();
+
+        assert!(first.is_valid());
+        assert_ne!(first, endpoint_changed);
+        assert_ne!(first, idempotence_changed);
+        assert_ne!(first, schema_changed);
+    }
+
+    #[test]
+    fn resume_contract_detects_python_source_edits_and_is_selector_only_for_browser_secrets() {
+        let root = std::env::temp_dir().join(format!(
+            "beater-resume-contract-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("tools")).unwrap();
+        let source = root.join("tools/echo.py");
+        fs::write(&source, "TOOL = {'description': 'one', 'input_schema': {'type': 'object'}}\ndef run(input): return input\n").unwrap();
+        let first = ToolRegistry::build(&root, &[py_decl("echo", "tools/echo.py", true)])
+            .unwrap()
+            .resume_contract("echo")
+            .unwrap();
+        fs::write(&source, "TOOL = {'description': 'two', 'input_schema': {'type': 'object'}}\ndef run(input): return input\n").unwrap();
+        let changed = ToolRegistry::build(&root, &[py_decl("echo", "tools/echo.py", true)])
+            .unwrap()
+            .resume_contract("echo")
+            .unwrap();
+        assert_ne!(first, changed);
+
+        let mut browser = browser_decl();
+        browser.secrets = json!({"password": {"type": "env", "env": "SHOP_PASSWORD"}});
+        let first_secret = ToolRegistry::build(&root, &[browser])
+            .unwrap()
+            .resume_contract("browser.checkout")
+            .unwrap();
+        let mut browser = browser_decl();
+        browser.secrets = json!({"password": {"type": "env", "env": "SHOP_PASSWORD"}});
+        let second_secret = ToolRegistry::build(&root, &[browser])
+            .unwrap()
+            .resume_contract("browser.checkout")
+            .unwrap();
+        assert_eq!(first_secret, second_secret);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_contract_base64_respects_exact_decoded_limit_and_padding() {
+        use super::bounded_resume_base64;
+        use base64::Engine;
+
+        for size in [MAX_RESUME_SOURCE_BYTES - 1, MAX_RESUME_SOURCE_BYTES] {
+            let source = vec![42; size as usize];
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&source);
+            assert_eq!(bounded_resume_base64(&encoded), Some(source));
+        }
+        let oversized = base64::engine::general_purpose::STANDARD.encode(vec![
+            42;
+            (MAX_RESUME_SOURCE_BYTES + 1)
+                as usize
+        ]);
+        assert_eq!(
+            oversized.len() as u64,
+            MAX_RESUME_SOURCE_BYTES.div_ceil(3) * 4
+        );
+        assert!(bounded_resume_base64(&oversized).is_none());
+        assert_eq!(bounded_resume_base64(""), Some(vec![]));
+        for malformed in ["A", "AA", "AAA", "====", "A===", "AA=A", "AA?="] {
+            assert!(bounded_resume_base64(malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn resume_contract_source_reads_are_bounded_regular_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "beater-resume-source-bound-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.wat");
+        fs::write(
+            &oversized,
+            vec![b'x'; (MAX_RESUME_SOURCE_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(bounded_regular_file_bytes(&oversized).is_none());
+        assert!(bounded_regular_file_bytes(&root).is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "current_thread")]
