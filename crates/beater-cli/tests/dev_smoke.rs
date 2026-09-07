@@ -4,6 +4,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use beater_journal::{
+    Goal, GoalMutation, GoalScope, Journal, PlaybookIdentity, verify_decision_audit_event,
+};
+use serde_json::{Value, json};
+
 struct TempDirGuard {
     path: PathBuf,
 }
@@ -16,6 +21,230 @@ impl Drop for TempDirGuard {
 
 struct ChildGuard {
     child: Child,
+}
+
+#[test]
+fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
+    let workspace = workspace();
+    let temp = temp_dir("decision-audit-cli");
+    let app = temp.path.join("app");
+    copy_dir_all(&workspace.join("examples/hello"), &app).expect("copy app fixture");
+    let scope = GoalScope {
+        organization: "org".into(),
+        project: "project".into(),
+        environment: "test".into(),
+        site: "site".into(),
+    };
+    let journal = Journal::open(&app).expect("open independent setup journal");
+    journal
+        .create_goal(
+            &GoalMutation {
+                actor: "owner".into(),
+                request_id: "create-goal".into(),
+                operation: "create".into(),
+            },
+            Goal {
+                id: "goal".into(),
+                scope: scope.clone(),
+                revision: 1,
+                objective: "Record a local decision".into(),
+                playbook: PlaybookIdentity {
+                    id: "generic-preparation".into(),
+                    digest: "a".repeat(64),
+                },
+                parameters: Default::default(),
+            },
+        )
+        .expect("create goal");
+    drop(journal);
+
+    let append = decision_append_input();
+    let server = DecisionLoopback::new(vec![
+        json!({"content":[{"type":"tool_use","id":"append-1","name":"decision_audit_append","input":append}],"stop_reason":"tool_use"}),
+        json!({"content":[{"type":"tool_use","id":"read-1","name":"decision_audit_read","input":{"version":1,"decision_id":"decision-a","expected_revision":1}}],"stop_reason":"tool_use"}),
+        json!({"content":[{"type":"text","text":"recorded"}],"stop_reason":"end_turn"}),
+    ]);
+    let output = Command::new(beater_bin(&workspace))
+        .args(["agent", "run-goal", "--app"])
+        .arg(&app)
+        .args([
+            "--run-id",
+            "goal-run",
+            "--organization",
+            "org",
+            "--project",
+            "project",
+            "--environment",
+            "test",
+            "--site",
+            "site",
+            "--goal-id",
+            "goal",
+            "--expected-revision",
+            "1",
+            "support",
+            "record it",
+        ])
+        .env("ANTHROPIC_API_KEY", "loopback-fixture-key")
+        .env("ANTHROPIC_BASE_URL", &server.base_url)
+        .env("BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("BEATER_LLM_API_KEY")
+        .env_remove("BEATER_LLM_BASE_URL")
+        .env_remove("BEATER_LLM_PROVIDER")
+        .output()
+        .expect("run actual beater binary");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("decision_audit_append"));
+    assert!(requests[1].contains("decision_audit_read"));
+
+    let reopened = Journal::open(&app).expect("reopen journal independently");
+    assert_eq!(reopened.run("goal-run").unwrap().status, "completed");
+    let history = reopened
+        .current_goal_run_decision_audit("goal-run", "decision-a", 1)
+        .expect("current exact binding");
+    assert_eq!(history.scope, scope);
+    assert_eq!(history.run_id, "goal-run");
+    assert_eq!(history.goal_id, "goal");
+    assert_eq!(history.goal_revision, 1);
+    assert_eq!(history.events.len(), 1);
+    verify_decision_audit_event(&history.events[0]).expect("event digest verifies");
+    let steps = reopened.steps("goal-run").expect("read persisted steps");
+    let read = steps
+        .iter()
+        .find(|step| step.tool_use_id.as_deref() == Some("read-1"))
+        .expect("persisted read tool call");
+    assert_eq!(read.status, "completed");
+    let persisted: Value =
+        serde_json::from_str(read.result.as_ref().unwrap()["content"].as_str().unwrap())
+            .expect("persisted exact read projection");
+    assert_eq!(persisted["goal_id"], "goal");
+    assert_eq!(persisted["goal_revision"], 1);
+    assert_eq!(
+        persisted["events"][0]["event_digest"],
+        history.events[0].event_digest
+    );
+    let third: Value =
+        serde_json::from_str(request_body(&requests[2])).expect("parse third model request");
+    let result = &third["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(result["tool_use_id"], "read-1");
+    assert!(result.get("is_error").is_none());
+    let model_projection: Value = serde_json::from_str(result["content"].as_str().unwrap())
+        .expect("parse replayed read projection");
+    assert_eq!(model_projection, persisted);
+}
+
+fn decision_append_input() -> Value {
+    json!({"version":1,"expected_revision":0,"package":{"version":1,"decision_id":"decision-a","revision":1,"domain":"software","question":"Record?","object_references":[],"evidence":[],"graph_context":null,"policy_references":[],"calculation_references":[],"model_references":[],"producer_references":[],"options":["record"],"constraints":["local"],"rationale":"local only","reviews":[],"authorization_observations":[],"effect_attempts":[],"acknowledgements":[],"outcomes":[],"reconciliations":[],"correction_of":null,"successor_to":null,"verification_ceiling":"RecordedOnly","execution_authority":"None"}})
+}
+
+struct DecisionLoopback {
+    base_url: String,
+    handle: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+impl DecisionLoopback {
+    fn new(responses: Vec<Value>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            responses.into_iter().map(|response| {
+            let (mut stream, _) = listener.accept().unwrap(); let request = read_request(&mut stream);
+            let body = anthropic_sse(response); let reply = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"); stream.write_all(reply.as_bytes()).unwrap(); request
+        }).collect()
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            handle: Some(handle),
+        }
+    }
+    fn join(mut self) -> Vec<String> {
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut chunk).expect("read loopback headers");
+        assert!(
+            count > 0 && bytes.len() + count <= 65_536,
+            "invalid loopback request headers"
+        );
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let headers = std::str::from_utf8(&bytes[..header_end]).expect("ASCII HTTP headers");
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+                .map(str::trim)
+        })
+        .expect("content length")
+        .parse::<usize>()
+        .expect("numeric content length");
+    assert!(length <= 65_536, "oversized loopback request body");
+    while bytes.len() - header_end < length {
+        let count = stream.read(&mut chunk).expect("read loopback body");
+        assert!(
+            count > 0 && bytes.len() + count <= header_end + length,
+            "truncated or oversized loopback body"
+        );
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(bytes).expect("UTF-8 loopback request")
+}
+fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").expect("HTTP separator").1
+}
+fn sse(event: &str, data: Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+fn anthropic_sse(response: Value) -> String {
+    let mut body = sse(
+        "message_start",
+        json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","model":"mock","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
+    );
+    for (index, block) in response["content"].as_array().unwrap().iter().enumerate() {
+        let mut start = block.clone();
+        if block["type"] == "tool_use" {
+            start["input"] = json!({});
+            body.push_str(&sse(
+                "content_block_start",
+                json!({"type":"content_block_start","index":index,"content_block":start}),
+            ));
+            body.push_str(&sse("content_block_delta", json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}})));
+        } else {
+            start["text"] = json!("");
+            body.push_str(&sse(
+                "content_block_start",
+                json!({"type":"content_block_start","index":index,"content_block":start}),
+            ));
+            body.push_str(&sse("content_block_delta", json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":block["text"]}})));
+        }
+        body.push_str(&sse(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+        ));
+    }
+    body.push_str(&sse("message_delta", json!({"type":"message_delta","delta":{"stop_reason":response["stop_reason"],"stop_sequence":null},"usage":{"output_tokens":1}})));
+    body.push_str(&sse("message_stop", json!({"type":"message_stop"})));
+    body
 }
 
 impl Drop for ChildGuard {
@@ -1371,12 +1600,9 @@ fn workspace() -> PathBuf {
 }
 
 fn beater_bin(workspace: &std::path::Path) -> String {
-    std::env::var("CARGO_BIN_EXE_beater").unwrap_or_else(|_| {
-        workspace
-            .join("target/debug/beater")
-            .to_string_lossy()
-            .into_owned()
-    })
+    let _ = workspace;
+    std::env::var("CARGO_BIN_EXE_beater")
+        .expect("cargo integration tests must execute the candidate beater binary")
 }
 
 fn free_port() -> u16 {

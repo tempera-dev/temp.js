@@ -18,3 +18,7 @@ clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+beater-journal.workspace = true
+serde_json.workspace = true
