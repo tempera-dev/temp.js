@@ -2714,7 +2714,10 @@ def run(input):
                     Some(&contract)
                 ))
         );
-        let _env = EnvGuard::set("http://127.0.0.1:9");
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"text","text":"mutant-only"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
         resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
             Ok(config(true))
         })
