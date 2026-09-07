@@ -487,6 +487,31 @@ fn validate_package(package: &DecisionPackageV1) -> Result<()> {
     Ok(())
 }
 
+/// Validates a closed v1 package without opening a journal transaction.
+/// This is integrity and bounded-shape validation only; it grants no authority.
+pub fn validate_decision_package_v1(package: &DecisionPackageV1) -> Result<()> {
+    validate_package(package)
+}
+
+/// Validates append coordinates before a caller records a durable request.
+pub fn validate_decision_append_request(expected_revision: i64) -> Result<()> {
+    ensure!(
+        (0..=MAX_REVISION).contains(&expected_revision),
+        "invalid expected decision revision"
+    );
+    Ok(())
+}
+
+/// Validates an exact read coordinate before a caller records a durable request.
+pub fn validate_decision_read_request(decision_id: &str, expected_revision: i64) -> Result<()> {
+    ensure!(valid_identifier(decision_id), "invalid decision id");
+    ensure!(
+        (1..=MAX_REVISION).contains(&expected_revision),
+        "invalid expected decision revision"
+    );
+    Ok(())
+}
+
 impl Journal {
     fn initialize_decision_audit(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         tx.execute_batch(

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::decision_tools;
 use crate::llm::{LlmClient, LlmSelection};
 use crate::ownership::RunOwnership;
 use crate::registry::{
@@ -65,6 +66,13 @@ fn setup(
     }
     let config: AgentConfig = serde_json::from_value(config_value)
         .context("agent.ts default export did not match defineAgent shape")?;
+    anyhow::ensure!(
+        config
+            .tools
+            .iter()
+            .all(|tool| !decision_tools::rejects_configured_name(&tool.name)),
+        "agent configuration cannot claim a runner-private decision tool name"
+    );
     let agent_dir = app_dir.join("agents").join(&config.name);
     let registry = ToolRegistry::build_with_beatbox_and_browser_session_dir(
         &agent_dir,
@@ -327,13 +335,15 @@ async fn resume_async(
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
                         }
                         None => {
+                            let private_contract = decision_tools::resume_contract(name);
+                            let registry_contract = ctx.registry.resume_contract(name);
                             if !tool_replay_matches_recorded_contract(
                                 run_id,
                                 name,
                                 id,
                                 &tu["input"],
                                 &steps,
-                                ctx.registry.resume_contract(name).as_ref(),
+                                private_contract.as_ref().or(registry_contract.as_ref()),
                             ) {
                                 ctx.journal.set_run_status(run_id, "needs_review")?;
                                 println!(
@@ -412,12 +422,23 @@ pub fn list_runs(app_dir: &Path) -> Result<()> {
 
 async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i64) -> Result<()> {
     for _ in 0..MAX_LOOP_STEPS {
+        let mut tools = ctx.registry.api_tools();
+        match ctx.journal.gate_goal_run(&ctx.run_id)? {
+            GoalRunGate::Current(_) => {
+                let definitions = tools
+                    .as_array_mut()
+                    .context("tool registry returned a non-array definition")?;
+                definitions.extend(decision_tools::tool_definitions());
+            }
+            GoalRunGate::Unbound => {}
+            GoalRunGate::NeedsReview => return Err(GoalRunNeedsReview.into()),
+        }
         let body = json!({
             "model": ctx.model,
             "max_tokens": MAX_TOKENS,
             "system": ctx.config.system,
             "thinking": {"type": "adaptive"},
-            "tools": ctx.registry.api_tools(),
+            "tools": tools,
             "messages": messages,
         });
 
@@ -464,11 +485,19 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                     saw_tool_use = true;
                     let id = block["id"].as_str().unwrap_or_default();
                     let name = block["name"].as_str().unwrap_or_default();
-                    println!("→ tool {name} {}", block["input"]);
+                    if decision_tools::resume_contract(name).is_some() {
+                        println!("→ tool {name} [runner-private decision input redacted]");
+                    } else {
+                        println!("→ tool {name} {}", block["input"]);
+                    }
                     let result = execute_tool_step(ctx, name, id, &block["input"], 1).await;
                     match result {
                         Ok(content) => {
-                            println!("← {content}");
+                            if decision_tools::resume_contract(name).is_some() {
+                                println!("← tool {name} completed (decision content redacted)");
+                            } else {
+                                println!("← {content}");
+                            }
                             tool_results.push(json!({
                                 "type": "tool_result", "tool_use_id": id, "content": content,
                             }));
@@ -617,6 +646,23 @@ async fn execute_tool_step(
     input: &Value,
     attempt: i64,
 ) -> Result<String> {
+    let private_tool = decision_tools::resume_contract(name);
+    if private_tool.is_some() {
+        match ctx.journal.gate_goal_run(&ctx.run_id)? {
+            GoalRunGate::Current(_) => {}
+            GoalRunGate::Unbound => {
+                bail!("runner-private decision tools require a current goal-bound run")
+            }
+            GoalRunGate::NeedsReview => return Err(GoalRunNeedsReview.into()),
+        }
+        // Strict parsing happens before `start_step`, so malformed package
+        // bodies cannot become durable tool requests.
+        match name {
+            decision_tools::APPEND_TOOL_NAME => decision_tools::validate_append(input)?,
+            decision_tools::READ_TOOL_NAME => decision_tools::validate_read(input)?,
+            _ => unreachable!(),
+        }
+    }
     let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
     let call = start_journaled_tool_call_with_contract(
         &ctx.journal,
@@ -626,8 +672,41 @@ async fn execute_tool_step(
         input,
         attempt,
         idempotency_key,
-        ctx.registry.resume_contract(name),
+        private_tool.or_else(|| ctx.registry.resume_contract(name)),
     )?;
+    if decision_tools::resume_contract(name).is_some() {
+        let projection = match name {
+            decision_tools::APPEND_TOOL_NAME => {
+                decision_tools::append(&ctx.journal, &ctx.run_id, tool_use_id, input)
+            }
+            decision_tools::READ_TOOL_NAME => {
+                decision_tools::read(&ctx.journal, &ctx.run_id, input)
+            }
+            _ => unreachable!(),
+        };
+        return match projection {
+            Ok(projection) => {
+                let result = serde_json::to_string(&projection)?;
+                complete_journaled_tool_call(&ctx.journal, &ctx.run_id, call.seq, &result)?;
+                Ok(result)
+            }
+            Err(error) => {
+                fail_journaled_tool_call(
+                    &ctx.journal,
+                    &ctx.run_id,
+                    call.seq,
+                    "decision audit operation failed",
+                )?;
+                if matches!(
+                    ctx.journal.gate_goal_run(&ctx.run_id)?,
+                    GoalRunGate::NeedsReview
+                ) {
+                    return Err(GoalRunNeedsReview.into());
+                }
+                Err(error)
+            }
+        };
+    }
     match ctx
         .registry
         .execute_with_context(name, input, &call.context)
@@ -694,7 +773,7 @@ fn tool_replay_matches_recorded_contract(
 
 #[cfg(test)]
 mod tests {
-    use super::{resume, run, tool_idempotency_key};
+    use super::{resume, run, run_for_goal, tool_idempotency_key};
     use crate::registry::{AgentConfig, BeatboxConfig, ToolRegistry};
     use beater_journal::Journal;
     use rusqlite::params;
@@ -1595,6 +1674,125 @@ def run(input):
             agent_name: "support".into(),
             prompt: "Prepare current goal".into(),
         }
+    }
+
+    fn decision_package_input(revision: i64, correction_of: Option<i64>) -> Value {
+        json!({
+            "version": 1,
+            "expected_revision": revision - 1,
+            "package": {
+                "version": 1,
+                "decision_id": "decision-a",
+                "revision": revision,
+                "domain": "software",
+                "question": "Record a local decision?",
+                "object_references": [], "evidence": [], "graph_context": null,
+                "policy_references": [], "calculation_references": [], "model_references": [], "producer_references": [],
+                "options": ["record"], "constraints": ["local-only"],
+                "rationale": "Preserve bounded local history.",
+                "reviews": [], "authorization_observations": [], "effect_attempts": [], "acknowledgements": [], "outcomes": [], "reconciliations": [],
+                "correction_of": correction_of.map(|previous| json!({"decision_id": "decision-a", "revision": previous})),
+                "successor_to": null,
+                "verification_ceiling": "RecordedOnly",
+                "execution_authority": "None"
+            }
+        })
+    }
+
+    #[test]
+    fn goal_runner_appends_corrects_reads_and_reopens_decision_history() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-tools");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let server = MockAnthropic::new(vec![
+            json!({"content": [{"type":"tool_use", "id":"decision-append-1", "name":"decision_audit_append", "input": decision_package_input(1, None)}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"tool_use", "id":"decision-append-2", "name":"decision_audit_append", "input": decision_package_input(2, Some(1))}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"tool_use", "id":"decision-read-2", "name":"decision_audit_read", "input": {"version":1, "decision_id":"decision-a", "expected_revision":2}}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"text", "text":"recorded"}], "stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(server.join().len(), 4);
+        drop(journal);
+        let reopened = Journal::open(app.path()).unwrap();
+        let history = reopened
+            .decision_audit(&request.scope, "decision-a")
+            .unwrap();
+        assert_eq!(history.current_revision, 2);
+        assert_eq!(history.events.len(), 2);
+        assert_eq!(
+            history.events[1]
+                .package
+                .correction_of
+                .as_ref()
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(reopened.run(&request.run_id).unwrap().status, "completed");
+    }
+
+    #[test]
+    fn stale_goal_before_private_append_keeps_no_decision_event() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-stale-before-append");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let app_path = app.path().to_path_buf();
+        let scope = request.scope.clone();
+        let server = MockAnthropic::before_response(
+            vec![
+                json!({"content": [{"type":"tool_use", "id":"decision-append", "name":"decision_audit_append", "input": decision_package_input(1, None)}], "stop_reason":"tool_use"}),
+            ],
+            move || revise_test_goal(&Journal::open(&app_path).unwrap(), &scope),
+        );
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(journal.run(&request.run_id).unwrap().status, "needs_review");
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_private_package_never_creates_a_tool_step_or_decision_event() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-invalid-before-step");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        let mut invalid = decision_package_input(1, None);
+        invalid["package"]["question"] = json!("x".repeat(4_097));
+        let server = MockAnthropic::new(vec![
+            json!({"content": [{"type":"tool_use", "id":"invalid-private", "name":"decision_audit_append", "input": invalid}], "stop_reason":"tool_use"}),
+            json!({"content": [{"type":"text", "text":"handled"}], "stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        assert_eq!(journal.steps(&request.run_id).unwrap().len(), 2);
+        assert!(
+            journal
+                .steps(&request.run_id)
+                .unwrap()
+                .iter()
+                .all(|step| step.kind != "tool_call")
+        );
+        assert!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .is_err()
+        );
     }
 
     fn revise_test_goal(journal: &Journal, scope: &beater_journal::GoalScope) {

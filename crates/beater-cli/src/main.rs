@@ -78,6 +78,31 @@ enum AgentCommand {
         /// The user prompt
         prompt: String,
     },
+    /// Start an agent run bound to one existing local goal revision
+    RunGoal {
+        /// App directory (contains beater.toml)
+        #[arg(long, default_value = ".")]
+        app: PathBuf,
+        /// Caller-chosen durable run identity; use `agent resume` after interruption
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        organization: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        environment: String,
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        goal_id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        /// Agent name (directory under agents/)
+        name: String,
+        /// The user prompt
+        prompt: String,
+    },
     /// Resume a crashed or interrupted run from its journal
     Resume {
         #[arg(long, default_value = ".")]
@@ -120,6 +145,40 @@ fn main() -> Result<()> {
                     app_config.python_venv,
                     app_config.beatbox,
                     &prompt,
+                )
+            }
+            AgentCommand::RunGoal {
+                app,
+                run_id,
+                organization,
+                project,
+                environment,
+                site,
+                goal_id,
+                expected_revision,
+                name,
+                prompt,
+            } => {
+                let app_config = beater_runtime::AppConfig::load(&app)?;
+                let request = beater_agent::GoalRunRequest {
+                    run_id,
+                    scope: beater_agent::GoalScope {
+                        organization,
+                        project,
+                        environment,
+                        site,
+                    },
+                    goal_id,
+                    expected_revision,
+                    agent_name: name,
+                    prompt,
+                };
+                beater_agent::run_for_goal(
+                    &app,
+                    &request,
+                    app_config.python_venv,
+                    app_config.beatbox,
+                    |agent| beater_runtime::load_agent_config(&app, agent),
                 )
             }
             AgentCommand::Resume { app, run_id } => {
