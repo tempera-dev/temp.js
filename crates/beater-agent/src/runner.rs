@@ -325,7 +325,18 @@ async fn resume_async(
                             && s.tool_use_id.as_deref() == Some(id)
                     });
                     let tool_result = match done {
-                        Some(s) => {
+                        Some(s)
+                            if completed_tool_matches_recorded_contract(
+                                run_id,
+                                name,
+                                id,
+                                &tu["input"],
+                                s,
+                                decision_tools::resume_contract(name)
+                                    .as_ref()
+                                    .or(ctx.registry.resume_contract(name).as_ref()),
+                            ) =>
+                        {
                             let content = s
                                 .result
                                 .as_ref()
@@ -333,6 +344,14 @@ async fn resume_async(
                                 .unwrap_or_default()
                                 .to_string();
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
+                        }
+                        Some(_) => {
+                            ctx.journal.set_run_status(run_id, "needs_review")?;
+                            println!(
+                                "run {run_id} needs review: completed tool {name} ({id}) does not exactly match its recorded declaration"
+                            );
+                            close_browser_sessions_best_effort(ctx).await;
+                            return Ok(());
                         }
                         None => {
                             let private_contract = decision_tools::resume_contract(name);
@@ -376,11 +395,17 @@ async fn resume_async(
                                     return Ok(());
                                 }
                                 Err(e) => {
-                                    println!("← tool error: {e:#}");
+                                    if decision_tools::resume_contract(name).is_some() {
+                                        println!(
+                                            "← tool {name} rejected (decision content redacted)"
+                                        );
+                                    } else {
+                                        println!("← tool error: {e:#}");
+                                    }
                                     json!({
                                         "type": "tool_result",
                                         "tool_use_id": id,
-                                        "content": format!("Error: {e:#}"),
+                                        "content": if decision_tools::resume_contract(name).is_some() { "Error: DECISION_AUDIT_REJECTED".to_string() } else { format!("Error: {e:#}") },
                                         "is_error": true,
                                     })
                                 }
@@ -653,7 +678,7 @@ async fn execute_tool_step(
 ) -> Result<String> {
     let private_tool = decision_tools::resume_contract(name);
     if private_tool.is_some() {
-        match ctx.journal.gate_goal_run(&ctx.run_id)? {
+        match redact_private_error(ctx.journal.gate_goal_run(&ctx.run_id))? {
             GoalRunGate::Current(_) => {}
             GoalRunGate::Unbound => {
                 bail!("runner-private decision tools require a current goal-bound run")
@@ -663,13 +688,17 @@ async fn execute_tool_step(
         // Strict parsing happens before `start_step`, so malformed package
         // bodies cannot become durable tool requests.
         match name {
-            decision_tools::APPEND_TOOL_NAME => decision_tools::validate_append(input)?,
-            decision_tools::READ_TOOL_NAME => decision_tools::validate_read(input)?,
+            decision_tools::APPEND_TOOL_NAME => {
+                redact_private_error(decision_tools::validate_append(input))?
+            }
+            decision_tools::READ_TOOL_NAME => {
+                redact_private_error(decision_tools::validate_read(input))?
+            }
             _ => unreachable!(),
         }
     }
     let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
-    let call = start_journaled_tool_call_with_contract(
+    let call = redact_private_error(start_journaled_tool_call_with_contract(
         &ctx.journal,
         &ctx.run_id,
         name,
@@ -678,7 +707,7 @@ async fn execute_tool_step(
         attempt,
         idempotency_key,
         private_tool.or_else(|| ctx.registry.resume_contract(name)),
-    )?;
+    ))?;
     if decision_tools::resume_contract(name).is_some() {
         let projection = match name {
             decision_tools::APPEND_TOOL_NAME => {
@@ -691,19 +720,26 @@ async fn execute_tool_step(
         };
         return match projection {
             Ok(projection) => {
-                let result = serde_json::to_string(&projection)?;
-                complete_journaled_tool_call(&ctx.journal, &ctx.run_id, call.seq, &result)?;
+                let result = redact_private_error(
+                    serde_json::to_string(&projection).map_err(anyhow::Error::from),
+                )?;
+                redact_private_error(complete_journaled_tool_call(
+                    &ctx.journal,
+                    &ctx.run_id,
+                    call.seq,
+                    &result,
+                ))?;
                 Ok(result)
             }
             Err(error) => {
-                fail_journaled_tool_call(
+                redact_private_error(fail_journaled_tool_call(
                     &ctx.journal,
                     &ctx.run_id,
                     call.seq,
                     "decision audit rejected",
-                )?;
+                ))?;
                 if matches!(
-                    ctx.journal.gate_goal_run(&ctx.run_id)?,
+                    redact_private_error(ctx.journal.gate_goal_run(&ctx.run_id))?,
                     GoalRunGate::NeedsReview
                 ) {
                     return Err(GoalRunNeedsReview.into());
@@ -727,6 +763,35 @@ async fn execute_tool_step(
             Err(e)
         }
     }
+}
+
+fn redact_private_error<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if is_review_error(&error) {
+            error
+        } else {
+            anyhow::anyhow!("DECISION_AUDIT_REJECTED")
+        }
+    })
+}
+
+fn completed_tool_matches_recorded_contract(
+    run_id: &str,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    step: &beater_journal::StepRow,
+    current: Option<&ToolResumeContract>,
+) -> bool {
+    step.status == "completed"
+        && tool_replay_matches_recorded_contract(
+            run_id,
+            name,
+            tool_use_id,
+            input,
+            std::slice::from_ref(step),
+            current,
+        )
 }
 
 fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
@@ -1873,6 +1938,47 @@ def run(input):
                 .decision_audit(&request.scope, "decision-a")
                 .unwrap()
                 .current_revision,
+            1
+        );
+    }
+
+    #[test]
+    fn private_read_refuses_a_different_current_goal_after_retaining_history() {
+        let app = TempApp::new("decision-read-current-goal");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                1,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        crate::decision_tools::append(
+            &journal,
+            &request.run_id,
+            "append",
+            &decision_package_input(1, None),
+        )
+        .unwrap();
+        revise_test_goal(&journal, &request.scope);
+        assert!(
+            crate::decision_tools::read(
+                &journal,
+                &request.run_id,
+                &json!({"version": 1, "decision_id": "decision-a", "expected_revision": 1})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .events
+                .len(),
             1
         );
     }

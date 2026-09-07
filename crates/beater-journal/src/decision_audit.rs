@@ -541,9 +541,7 @@ impl Journal {
             GoalRunGate::Unbound => {
                 anyhow::bail!("decision audit requires a current goal-bound run")
             }
-            GoalRunGate::NeedsReview => {
-                anyhow::bail!("decision audit requires a current goal-bound run")
-            }
+            GoalRunGate::NeedsReview => return Err(crate::GoalRunNeedsReview.into()),
         };
         let body: String = tx.query_row(
             "SELECT body FROM goals WHERE organization=?1 AND project=?2 AND environment=?3 AND site=?4 AND id=?5",
@@ -735,6 +733,39 @@ impl Journal {
         let result = Self::read_decision_projection_in_tx(&tx, scope, decision_id)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Reads a decision only while the run's exact current goal binding and the
+    /// decision's recorded binding are observed in one SQLite transaction. This
+    /// is a transaction linearization point, not a promise about later changes.
+    pub fn current_goal_run_decision_audit(
+        &self,
+        run_id: &str,
+        decision_id: &str,
+        expected_revision: i64,
+    ) -> Result<DecisionAuditProjectionV1> {
+        ensure!(valid_identifier(run_id), "invalid decision read run id");
+        ensure!(valid_identifier(decision_id), "invalid decision id");
+        ensure!(
+            (1..=MAX_REVISION).contains(&expected_revision),
+            "invalid expected decision revision"
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        Self::initialize_decision_audit(&tx)?;
+        let (binding, _, _) = Self::current_decision_binding(&tx, run_id)?;
+        let projection = Self::read_decision_projection_in_tx(&tx, &binding.scope, decision_id)?;
+        ensure!(
+            projection.run_id == run_id
+                && projection.goal_id == binding.goal_id
+                && projection.goal_revision == binding.goal_revision,
+            "decision read is not bound to the current goal revision"
+        );
+        ensure!(
+            projection.current_revision == expected_revision,
+            "decision read revision changed; exact historical replay is unavailable"
+        );
+        tx.commit()?;
+        Ok(projection)
     }
 
     fn read_decision_projection_in_tx(

@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result, ensure};
 use beater_journal::{
-    DecisionAuditProjectionV1, DecisionPackageV1, GoalRunGate, Journal,
-    validate_decision_append_request, validate_decision_package_v1, validate_decision_read_request,
+    DecisionAuditProjectionV1, DecisionPackageV1, Journal, validate_decision_append_request,
+    validate_decision_package_v1, validate_decision_read_request,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -102,26 +102,7 @@ pub fn validate_read(input: &Value) -> Result<()> {
 
 pub fn read(journal: &Journal, run_id: &str, input: &Value) -> Result<DecisionAuditProjectionV1> {
     let input = parse_read(input)?;
-    let scope = match journal.gate_goal_run(run_id)? {
-        GoalRunGate::Current(binding) => binding.scope,
-        GoalRunGate::Unbound => anyhow::bail!("decision read requires a current goal-bound run"),
-        GoalRunGate::NeedsReview => return Err(beater_journal::GoalRunNeedsReview.into()),
-    };
-    let projection = journal.decision_audit(&scope, &input.decision_id)?;
-    let binding = match journal.gate_goal_run(run_id)? {
-        GoalRunGate::Current(binding) => binding,
-        GoalRunGate::Unbound => anyhow::bail!("decision read requires a current goal-bound run"),
-        GoalRunGate::NeedsReview => return Err(beater_journal::GoalRunNeedsReview.into()),
-    };
-    ensure!(
-        projection.goal_id == binding.goal_id && projection.goal_revision == binding.goal_revision,
-        "decision read is not bound to the current goal revision"
-    );
-    ensure!(
-        projection.current_revision == input.expected_revision,
-        "decision read revision changed; exact historical replay is unavailable"
-    );
-    Ok(projection)
+    journal.current_goal_run_decision_audit(run_id, &input.decision_id, input.expected_revision)
 }
 
 fn parse_append(input: &Value) -> Result<AppendInput> {
@@ -171,6 +152,17 @@ fn reference_schema() -> Value {
     })
 }
 
+fn optional_reference_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["locator", "revision"],
+        "properties": {
+            "locator": {"type": "string", "minLength": 1, "maxLength": 512},
+            "revision": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]}
+        }
+    })
+}
+
 fn typed_reference_schema() -> Value {
     json!({
         "type": "object", "additionalProperties": false,
@@ -185,7 +177,11 @@ fn decision_package_schema() -> Value {
     let evidence = json!({
         "type": "object", "additionalProperties": false,
         "required": ["reference", "missing"],
-        "properties": {"reference": reference.clone(), "missing": {"type": "boolean"}}
+        "properties": {"reference": optional_reference_schema(), "missing": {"type": "boolean"}},
+        "allOf": [{
+            "if": {"properties": {"missing": {"const": false}}, "required": ["missing"]},
+            "then": {"properties": {"reference": reference.clone()}}
+        }]
     });
     let graph_context = json!({
         "type": "object", "additionalProperties": false,
@@ -268,6 +264,13 @@ mod tests {
             .unwrap();
         assert_eq!(read["input_schema"]["additionalProperties"], false);
         assert_eq!(read["input_schema"]["properties"]["version"]["const"], 1);
+        let evidence =
+            &append["input_schema"]["properties"]["package"]["properties"]["evidence"]["items"];
+        assert_eq!(
+            evidence["properties"]["reference"]["properties"]["revision"]["anyOf"][1]["type"],
+            "null"
+        );
+        assert!(evidence["allOf"].is_array());
     }
 }
 
