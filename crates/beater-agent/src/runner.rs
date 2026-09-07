@@ -509,10 +509,15 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                             return Ok(());
                         }
                         Err(e) => {
-                            println!("← tool error: {e:#}");
+                            let private = decision_tools::resume_contract(name).is_some();
+                            if private {
+                                println!("← tool {name} rejected (decision content redacted)");
+                            } else {
+                                println!("← tool error: {e:#}");
+                            }
                             tool_results.push(json!({
                                 "type": "tool_result", "tool_use_id": id,
-                                "content": format!("Error: {e:#}"), "is_error": true,
+                                "content": if private { "Error: decision audit rejected".to_string() } else { format!("Error: {e:#}") }, "is_error": true,
                             }));
                         }
                     }
@@ -695,7 +700,7 @@ async fn execute_tool_step(
                     &ctx.journal,
                     &ctx.run_id,
                     call.seq,
-                    "decision audit operation failed",
+                    "decision audit rejected",
                 )?;
                 if matches!(
                     ctx.journal.gate_goal_run(&ctx.run_id)?,
@@ -703,7 +708,8 @@ async fn execute_tool_step(
                 ) {
                     return Err(GoalRunNeedsReview.into());
                 }
-                Err(error)
+                let _ = error;
+                bail!("decision audit rejected")
             }
         };
     }
@@ -1793,6 +1799,121 @@ def run(input):
                 .decision_audit(&request.scope, "decision-a")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unsupported_private_authority_and_version_never_create_tool_steps() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        for (label, mut input) in [
+            ("authority", decision_package_input(1, None)),
+            ("version", decision_package_input(1, None)),
+        ] {
+            if label == "authority" {
+                input["package"]["execution_authority"] = json!("Execute");
+            } else {
+                input["version"] = json!(2);
+            }
+            let app = TempApp::new(&format!("decision-invalid-{label}"));
+            let journal = Journal::open(app.path()).unwrap();
+            let request = create_goal_request(&journal);
+            let server = MockAnthropic::new(vec![
+                json!({"content":[{"type":"tool_use","id":"invalid","name":"decision_audit_append","input":input}],"stop_reason":"tool_use"}),
+                json!({"content":[{"type":"text","text":"handled"}],"stop_reason":"end_turn"}),
+            ]);
+            let _env = EnvGuard::set(&server.base_url);
+            run_for_goal(app.path(), &request, None, BeatboxConfig::default(), |_| {
+                Ok(config(true))
+            })
+            .unwrap();
+            assert!(
+                journal
+                    .steps(&request.run_id)
+                    .unwrap()
+                    .iter()
+                    .all(|step| step.kind != "tool_call")
+            );
+        }
+    }
+
+    #[test]
+    fn private_append_cas_and_replay_conflict_preserve_one_revision() {
+        let app = TempApp::new("decision-cas-replay");
+        let journal = Journal::open(app.path()).unwrap();
+        let request = create_goal_request(&journal);
+        journal
+            .create_goal_bound_run(
+                &request.scope,
+                &request.goal_id,
+                request.expected_revision,
+                &request.run_id,
+                &request.agent_name,
+                &request.prompt,
+            )
+            .unwrap();
+        let first = decision_package_input(1, None);
+        crate::decision_tools::append(&journal, &request.run_id, "same-id", &first).unwrap();
+        assert_eq!(
+            crate::decision_tools::append(&journal, &request.run_id, "same-id", &first)
+                .unwrap()
+                .current_revision,
+            1
+        );
+        let mut changed = first.clone();
+        changed["package"]["question"] = json!("changed");
+        assert!(
+            crate::decision_tools::append(&journal, &request.run_id, "same-id", &changed).is_err()
+        );
+        let mut conflict = decision_package_input(2, Some(1));
+        conflict["expected_revision"] = json!(0);
+        assert!(
+            crate::decision_tools::append(&journal, &request.run_id, "new-id", &conflict).is_err()
+        );
+        assert_eq!(
+            journal
+                .decision_audit(&request.scope, "decision-a")
+                .unwrap()
+                .current_revision,
+            1
+        );
+    }
+
+    #[test]
+    fn configured_private_name_is_rejected_before_run_creation() {
+        let app = TempApp::new("decision-name-collision");
+        let error = run(app.path(), "support", json!({"name":"support","provider":"anthropic","model":"x","tools":[{"kind":"rust","name":"decision_audit_append"}]}), None, BeatboxConfig::default(), "x").unwrap_err();
+        assert!(format!("{error:#}").contains("runner-private decision tool name"));
+        assert!(
+            Journal::open(app.path())
+                .unwrap()
+                .list_runs()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unbound_runner_does_not_advertise_or_execute_private_tools() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("decision-unbound");
+        let server = MockAnthropic::new(vec![
+            json!({"content":[{"type":"tool_use","id":"forged","name":"decision_audit_append","input":decision_package_input(1, None)}],"stop_reason":"tool_use"}),
+            json!({"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}),
+        ]);
+        let _env = EnvGuard::set(&server.base_url);
+        run(
+            app.path(),
+            "support",
+            config(true),
+            None,
+            BeatboxConfig::default(),
+            "x",
+        )
+        .unwrap();
+        let requests = server.join();
+        assert!(!requests[0].contains("decision_audit_append"));
+        let journal = Journal::open(app.path()).unwrap();
+        let (_, steps) = journal.list_runs().unwrap().pop().unwrap();
+        assert_eq!(steps, 2);
     }
 
     fn revise_test_goal(journal: &Journal, scope: &beater_journal::GoalScope) {

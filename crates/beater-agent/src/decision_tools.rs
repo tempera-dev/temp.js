@@ -108,6 +108,15 @@ pub fn read(journal: &Journal, run_id: &str, input: &Value) -> Result<DecisionAu
         GoalRunGate::NeedsReview => return Err(beater_journal::GoalRunNeedsReview.into()),
     };
     let projection = journal.decision_audit(&scope, &input.decision_id)?;
+    let binding = match journal.gate_goal_run(run_id)? {
+        GoalRunGate::Current(binding) => binding,
+        GoalRunGate::Unbound => anyhow::bail!("decision read requires a current goal-bound run"),
+        GoalRunGate::NeedsReview => return Err(beater_journal::GoalRunNeedsReview.into()),
+    };
+    ensure!(
+        projection.goal_id == binding.goal_id && projection.goal_revision == binding.goal_revision,
+        "decision read is not bound to the current goal revision"
+    );
     ensure!(
         projection.current_revision == input.expected_revision,
         "decision read revision changed; exact historical replay is unavailable"
@@ -157,7 +166,7 @@ fn reference_schema() -> Value {
         "required": ["locator", "revision"],
         "properties": {
             "locator": {"type": "string", "minLength": 1, "maxLength": 512},
-            "revision": {"type": ["string", "null"], "maxLength": 512}
+            "revision": {"type": "string", "minLength": 1, "maxLength": 512}
         }
     })
 }
@@ -183,7 +192,7 @@ fn decision_package_schema() -> Value {
         "required": ["reference", "watermark"],
         "properties": {
             "reference": reference.clone(),
-            "watermark": {"type": ["string", "null"], "maxLength": 512}
+            "watermark": {"type": "string", "minLength": 1, "maxLength": 512}
         }
     });
     let revision_reference = json!({
