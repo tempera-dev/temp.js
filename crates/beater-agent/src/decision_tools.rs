@@ -18,6 +18,8 @@ use crate::resume_contract::ToolResumeContract;
 pub const APPEND_TOOL_NAME: &str = "decision_audit_append";
 pub const READ_TOOL_NAME: &str = "decision_audit_read";
 const TOOL_VERSION: u8 = 1;
+const IDENTIFIER_PATTERN: &str = "^[A-Za-z0-9_.:-]+$";
+const REFERENCE_PATTERN: &str = "^[A-Za-z0-9_.:/@-]+$";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,8 +148,8 @@ fn reference_schema() -> Value {
         "type": "object", "additionalProperties": false,
         "required": ["locator", "revision"],
         "properties": {
-            "locator": {"type": "string", "minLength": 1, "maxLength": 512},
-            "revision": {"type": "string", "minLength": 1, "maxLength": 512}
+            "locator": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": REFERENCE_PATTERN},
+            "revision": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": REFERENCE_PATTERN}
         }
     })
 }
@@ -157,8 +159,8 @@ fn optional_reference_schema() -> Value {
         "type": "object", "additionalProperties": false,
         "required": ["locator", "revision"],
         "properties": {
-            "locator": {"type": "string", "minLength": 1, "maxLength": 512},
-            "revision": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]}
+            "locator": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": REFERENCE_PATTERN},
+            "revision": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 512, "pattern": REFERENCE_PATTERN}, {"type": "null"}]}
         }
     })
 }
@@ -188,14 +190,14 @@ fn decision_package_schema() -> Value {
         "required": ["reference", "watermark"],
         "properties": {
             "reference": reference.clone(),
-            "watermark": {"type": "string", "minLength": 1, "maxLength": 512}
+            "watermark": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": REFERENCE_PATTERN}
         }
     });
     let revision_reference = json!({
         "type": "object", "additionalProperties": false,
         "required": ["decision_id", "revision"],
         "properties": {
-            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": IDENTIFIER_PATTERN},
             "revision": {"type": "integer", "minimum": 1, "maximum": 1_000_000_000}
         }
     });
@@ -210,7 +212,7 @@ fn decision_package_schema() -> Value {
         ],
         "properties": {
             "version": {"type": "integer", "const": 1},
-            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": IDENTIFIER_PATTERN},
             "revision": {"type": "integer", "minimum": 1, "maximum": 1_000_000_000},
             "domain": {"type": "string", "enum": ["software", "supply", "payments", "operations"]},
             "question": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -245,7 +247,7 @@ fn read_schema() -> Value {
         "required": ["version", "decision_id", "expected_revision"],
         "properties": {
             "version": {"type": "integer", "const": TOOL_VERSION},
-            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "decision_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": IDENTIFIER_PATTERN},
             "expected_revision": {"type": "integer", "minimum": 1, "maximum": 1_000_000_000}
         }
     })
@@ -253,7 +255,10 @@ fn read_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{APPEND_TOOL_NAME, READ_TOOL_NAME, rejects_configured_name, tool_definitions};
+    use super::{
+        APPEND_TOOL_NAME, READ_TOOL_NAME, rejects_configured_name, tool_definitions, validate_read,
+    };
+    use serde_json::json;
 
     #[test]
     fn private_schemas_are_closed_and_versioned() {
@@ -284,5 +289,44 @@ mod tests {
             "null"
         );
         assert!(evidence["allOf"].is_array());
+        let package = &append["input_schema"]["properties"]["package"];
+        assert_eq!(
+            package["properties"]["decision_id"]["pattern"],
+            "^[A-Za-z0-9_.:-]+$"
+        );
+        assert_eq!(
+            package["properties"]["object_references"]["items"]["properties"]["locator"]["pattern"],
+            "^[A-Za-z0-9_.:/@-]+$"
+        );
+        assert_eq!(
+            package["properties"]["graph_context"]["anyOf"][0]["properties"]["watermark"]["pattern"],
+            "^[A-Za-z0-9_.:/@-]+$"
+        );
+    }
+
+    #[test]
+    fn read_identifier_descriptor_matches_runtime_lexical_boundary() {
+        assert!(
+            validate_read(
+                &json!({"version": 1, "decision_id": "id:ok_1.a", "expected_revision": 1})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_read(
+                &json!({"version": 1, "decision_id": "id/invalid", "expected_revision": 1})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_read(
+                &json!({"version": 1, "decision_id": "id space", "expected_revision": 1})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_read(&json!({"version": 1, "decision_id": "é", "expected_revision": 1}))
+                .is_err()
+        );
     }
 }
