@@ -319,23 +319,25 @@ async fn resume_async(
                         tu["id"].as_str().unwrap_or_default(),
                         tu["name"].as_str().unwrap_or_default(),
                     );
-                    let done = steps.iter().find(|s| {
-                        s.kind == "tool_call"
-                            && s.status == "completed"
-                            && s.tool_use_id.as_deref() == Some(id)
-                    });
-                    let tool_result = match done {
-                        Some(s)
-                            if completed_tool_matches_recorded_contract(
-                                run_id,
-                                name,
-                                id,
-                                &tu["input"],
-                                s,
-                                decision_tools::resume_contract(name)
-                                    .as_ref()
-                                    .or(ctx.registry.resume_contract(name).as_ref()),
-                            ) =>
+                    let done: Vec<_> = steps
+                        .iter()
+                        .filter(|s| {
+                            s.kind == "tool_call"
+                                && s.status == "completed"
+                                && s.tool_use_id.as_deref() == Some(id)
+                        })
+                        .collect();
+                    let tool_result = match done.as_slice() {
+                        [s] if completed_tool_matches_recorded_contract(
+                            run_id,
+                            name,
+                            id,
+                            &tu["input"],
+                            s,
+                            decision_tools::resume_contract(name)
+                                .as_ref()
+                                .or(ctx.registry.resume_contract(name).as_ref()),
+                        ) =>
                         {
                             let content = s
                                 .result
@@ -345,15 +347,7 @@ async fn resume_async(
                                 .to_string();
                             json!({"type": "tool_result", "tool_use_id": id, "content": content})
                         }
-                        Some(_) => {
-                            ctx.journal.set_run_status(run_id, "needs_review")?;
-                            println!(
-                                "run {run_id} needs review: completed tool {name} ({id}) does not exactly match its recorded declaration"
-                            );
-                            close_browser_sessions_best_effort(ctx).await;
-                            return Ok(());
-                        }
-                        None => {
+                        [] => {
                             let private_contract = decision_tools::resume_contract(name);
                             let registry_contract = ctx.registry.resume_contract(name);
                             if !tool_replay_matches_recorded_contract(
@@ -410,6 +404,14 @@ async fn resume_async(
                                     })
                                 }
                             }
+                        }
+                        _ => {
+                            ctx.journal.set_run_status(run_id, "needs_review")?;
+                            println!(
+                                "run {run_id} needs review: completed tool {name} ({id}) is ambiguous or does not exactly match its recorded declaration"
+                            );
+                            close_browser_sessions_best_effort(ctx).await;
+                            return Ok(());
                         }
                     };
                     tool_results.push(tool_result);
@@ -542,7 +544,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                             }
                             tool_results.push(json!({
                                 "type": "tool_result", "tool_use_id": id,
-                                "content": if private { "Error: decision audit rejected".to_string() } else { format!("Error: {e:#}") }, "is_error": true,
+                                "content": if private { "Error: DECISION_AUDIT_REJECTED".to_string() } else { format!("Error: {e:#}") }, "is_error": true,
                             }));
                         }
                     }
@@ -736,7 +738,7 @@ async fn execute_tool_step(
                     &ctx.journal,
                     &ctx.run_id,
                     call.seq,
-                    "decision audit rejected",
+                    "DECISION_AUDIT_REJECTED",
                 ))?;
                 if matches!(
                     redact_private_error(ctx.journal.gate_goal_run(&ctx.run_id))?,
@@ -745,7 +747,7 @@ async fn execute_tool_step(
                     return Err(GoalRunNeedsReview.into());
                 }
                 let _ = error;
-                bail!("decision audit rejected")
+                bail!("DECISION_AUDIT_REJECTED")
             }
         };
     }
@@ -1841,7 +1843,8 @@ def run(input):
         let journal = Journal::open(app.path()).unwrap();
         let request = create_goal_request(&journal);
         let mut invalid = decision_package_input(1, None);
-        invalid["package"]["question"] = json!("x".repeat(4_097));
+        let canary = "PRIVATE_DECISION_CANARY";
+        invalid["package"]["question"] = json!(format!("{canary}{}", "x".repeat(4_097)));
         let server = MockAnthropic::new(vec![
             json!({"content": [{"type":"tool_use", "id":"invalid-private", "name":"decision_audit_append", "input": invalid}], "stop_reason":"tool_use"}),
             json!({"content": [{"type":"text", "text":"handled"}], "stop_reason":"end_turn"}),
@@ -1851,6 +1854,26 @@ def run(input):
             Ok(config(true))
         })
         .unwrap();
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let replay: Value = serde_json::from_str(&requests[1]).unwrap();
+        let result = &replay["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        assert_eq!(result["tool_use_id"], "invalid-private");
+        assert_eq!(result["content"], "Error: DECISION_AUDIT_REJECTED");
+        assert!(
+            !result.to_string().contains(canary),
+            "private rejection must not echo into tool result"
+        );
+        assert!(
+            journal.steps(&request.run_id).unwrap().iter().any(|step| {
+                step.kind == "llm_call"
+                    && step
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.to_string().contains(canary))
+            }),
+            "original private model response is retained in the journal"
+        );
         assert_eq!(journal.steps(&request.run_id).unwrap().len(), 2);
         assert!(
             journal
