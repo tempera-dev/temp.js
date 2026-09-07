@@ -64,7 +64,11 @@ fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
         json!({"content":[{"type":"tool_use","id":"read-1","name":"decision_audit_read","input":{"version":1,"decision_id":"decision-a","expected_revision":1}}],"stop_reason":"tool_use"}),
         json!({"content":[{"type":"text","text":"recorded"}],"stop_reason":"end_turn"}),
     ]);
+    // Do not inherit a developer's trace/export credentials or endpoints: this
+    // smoke owns only its loopback model fixture and must never export private
+    // journal/tool content to an ambient collector.
     let output = Command::new(beater_bin(&workspace))
+        .env_clear()
         .args(["agent", "run-goal", "--app"])
         .arg(&app)
         .args([
@@ -88,9 +92,6 @@ fn agent_run_goal_cli_records_and_reopens_goal_bound_decision_history() {
         .env("ANTHROPIC_API_KEY", "loopback-fixture-key")
         .env("ANTHROPIC_BASE_URL", &server.base_url)
         .env("BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK", "1")
-        .env_remove("BEATER_LLM_API_KEY")
-        .env_remove("BEATER_LLM_BASE_URL")
-        .env_remove("BEATER_LLM_PROVIDER")
         .output()
         .expect("run actual beater binary");
     assert!(
